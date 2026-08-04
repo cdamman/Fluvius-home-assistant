@@ -101,12 +101,15 @@ async def async_import_interval_statistics(
         return
 
     is_gas = meter_type == METER_TYPE_GAS
+    # External statistics have no device to group them, so the name is all the user
+    # sees in the Energy dashboard picker: it has to say which meter it belongs to.
+    kind = "gas" if is_gas else "electricity"
     resolution = "hourly" if is_gas else "quarter-hourly"
 
-    series = [(METRIC_CONSUMPTION, f"Fluvius consumption ({resolution})", 0)]
+    series = [(METRIC_CONSUMPTION, f"Fluvius {kind} consumption ({resolution})", 0)]
     # Gas meters only ever consume, so an injection series would be a flat zero.
     if not is_gas:
-        series.append((METRIC_INJECTION, f"Fluvius injection ({resolution})", 1))
+        series.append((METRIC_INJECTION, f"Fluvius {kind} injection ({resolution})", 1))
 
     for metric, label, index in series:
         await _async_import_series(
