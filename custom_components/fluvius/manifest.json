@@ -1,6 +1,7 @@
 {
   "domain": "fluvius",
   "name": "Fluvius Energy",
+  "after_dependencies": ["recorder"],
   "codeowners": ["@sander110419"],
   "config_flow": true,
   "documentation": "https://github.com/sander110419/Fluvius-home-assistant/blob/main/README.md",

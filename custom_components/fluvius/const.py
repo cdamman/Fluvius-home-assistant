@@ -35,9 +35,61 @@ METER_TYPE_OPTIONS = (METER_TYPE_ELECTRICITY, METER_TYPE_GAS)
 GAS_MIN_LOOKBACK_DAYS = 7
 GAS_SUPPORTED_GRANULARITY = "4"
 
-# Hourly/quarter-hourly granularity for detailed consumption data
-HOURLY_GRANULARITY = "1"  # 15-minute intervals
-DEFAULT_HOURLY_DAYS_BACK = 1  # Fetch today's data by default
+# The daily summary endpoint is the only consumer of CONF_GRANULARITY, and it only
+# behaves with the daily code: sub-daily codes reject the multi-day ranges the
+# summaries need and answer with an empty payload. Sub-daily data has its own request
+# path (see INTERVAL_GRANULARITY_CANDIDATES), so nothing is lost by forcing this.
+SUMMARY_GRANULARITY = "4"
+
+# Sub-daily ("interval") consumption data.
+#
+# Flemish digital meters register electricity per quarter-hour and gas per hour, so
+# the resolution to expect depends on the meter type. Fluvius does not document the
+# granularity codes: "1" is confirmed to yield 15-minute intervals, "4" daily ones,
+# and the rest is guesswork. Rather than hard-code a guess, the client probes the
+# candidates below and keeps the first one that actually returns the expected
+# interval length, logging what it settled on.
+INTERVAL_MINUTES_BY_METER_TYPE = {
+    METER_TYPE_ELECTRICITY: 15,
+    METER_TYPE_GAS: 60,
+}
+INTERVAL_GRANULARITY_CANDIDATES = {
+    # Both confirmed against the live API.
+    METER_TYPE_ELECTRICITY: ("1", "3", "2"),
+    METER_TYPE_GAS: ("2", "1", "3"),
+}
+
+# Fluvius bills gas on a "gas day" running 06:00 -> 06:00 local, and the interval
+# endpoint returns an empty list for any window that does not line up with it.
+# Electricity uses plain calendar days.
+GAS_DAY_START_HOUR = 6
+
+# Present on the interval requests the portal itself issues, for both meter types.
+INTERVAL_EXTRA_PARAMS = {"mandateDisplayMode": "1"}
+
+# The interval endpoint takes one request per day, unlike the daily summaries which
+# fetch their whole range in one go. CONF_DAYS_BACK drives both, capped here so a
+# deep daily history does not turn into a burst of interval requests every refresh.
+MAX_INTERVAL_DAYS_BACK = 14
+# Gas is published with a ~72h delay, so a short window always comes back empty.
+GAS_MIN_INTERVAL_LOOKBACK_DAYS = 5
+
+# Long term statistics fed to the Energy dashboard, keyed by EAN. The prefix keeps
+# the statistic id truthful about the resolution it holds.
+STATISTIC_ID_TEMPLATE = "{domain}:{ean}_{key}"
+INTERVAL_KEY_PREFIX = {
+    METER_TYPE_ELECTRICITY: "quarter_hourly",
+    METER_TYPE_GAS: "hourly",
+}
+METRIC_CONSUMPTION = "consumption"
+METRIC_INJECTION = "injection"
+
+
+def interval_key(meter_type: str, metric: str) -> str:
+    """Return the entity/statistic key for a metric at this meter's resolution."""
+
+    prefix = INTERVAL_KEY_PREFIX.get(meter_type, INTERVAL_KEY_PREFIX[METER_TYPE_ELECTRICITY])
+    return f"{prefix}_{metric}"
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 

@@ -94,6 +94,12 @@
       "peak_power": {
         "name": "Peak power"
       },
+      "hourly_consumption": {
+        "name": "Consumption (hourly)"
+      },
+      "hourly_injection": {
+        "name": "Injection (hourly)"
+      },
       "quarter_hourly_consumption": {
         "name": "Consumption (quarter-hourly)"
       },
