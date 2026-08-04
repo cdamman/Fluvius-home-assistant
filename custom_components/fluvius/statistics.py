@@ -163,6 +163,17 @@ async def _async_import_series(
     if not buckets:
         return
 
+    metadata: StatisticMetaData = {
+        **_MEAN_METADATA,
+        "has_sum": True,
+        "name": name,
+        "source": DOMAIN,
+        "statistic_id": statistic_id,
+        "unit_of_measurement": unit,
+    }
+    if _SUPPORTS_UNIT_CLASS:
+        metadata["unit_class"] = _UNIT_CLASSES.get(unit)
+
     running_sum, last_start = await _async_get_last_state(hass, statistic_id)
     earliest = min(buckets)
 
@@ -178,8 +189,15 @@ async def _async_import_series(
         missing = sorted(hour for hour in buckets if hour not in existing)
 
         if not missing:
+            # No new hours, but the metadata still has to go out: it carries the
+            # display name, unit and unit class, and a series that is permanently up
+            # to date would otherwise never pick up a rename. The recorder compares
+            # before writing, so an unchanged metadata costs nothing.
+            async_add_external_statistics(hass, metadata, [])
             LOGGER.debug(
-                "Statistics %s already up to date (last hour %s)", statistic_id, last_start
+                "Statistics %s already up to date (last hour %s); metadata refreshed",
+                statistic_id,
+                last_start,
             )
             return
 
@@ -208,16 +226,6 @@ async def _async_import_series(
     if not stats:
         return
 
-    metadata: StatisticMetaData = {
-        **_MEAN_METADATA,
-        "has_sum": True,
-        "name": name,
-        "source": DOMAIN,
-        "statistic_id": statistic_id,
-        "unit_of_measurement": unit,
-    }
-    if _SUPPORTS_UNIT_CLASS:
-        metadata["unit_class"] = _UNIT_CLASSES.get(unit)
     async_add_external_statistics(hass, metadata, stats)
     running_sum = float(stats[-1]["sum"] or 0.0)
     LOGGER.debug(
