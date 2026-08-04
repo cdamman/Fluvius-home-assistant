@@ -27,11 +27,11 @@ from .const import (
     GAS_UNIT_CUBIC_METERS,
     INTERVAL_EXTRA_PARAMS,
     INTERVAL_GRANULARITY_CANDIDATES,
-    GAS_SUPPORTED_GRANULARITY,
     INTERVAL_MINUTES_BY_METER_TYPE,
     MAX_INTERVAL_DAYS_BACK,
     METER_TYPE_ELECTRICITY,
     METER_TYPE_GAS,
+    SUMMARY_GRANULARITY,
 )
 from .auth import FluviusAuthError, async_get_bearer_token
 
@@ -507,9 +507,7 @@ class FluviusApiClient:
 
     async def _fetch_raw_consumption(self, access_token: str) -> List[Dict[str, Any]]:
         history_params = self._build_history_range()
-        granularity = str(self._options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY))
-        if self._meter_type == METER_TYPE_GAS:
-            granularity = GAS_SUPPORTED_GRANULARITY
+        granularity = self._resolve_summary_granularity()
         params = {
             **history_params,
             "granularity": granularity,
@@ -599,6 +597,25 @@ class FluviusApiClient:
             self._log_verbose("First item keys: %s", list(data[0].keys()) if data[0] else "empty")
         
         return data
+
+    def _resolve_summary_granularity(self) -> str:
+        """Return the granularity used for the daily summaries.
+
+        Only the daily code returns data for the multi-day ranges the summaries are
+        built from; a sub-daily code answers HTTP 200 with an empty list, which used
+        to silently leave every daily and lifetime sensor at zero.
+        """
+
+        configured = str(self._options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY))
+        if configured != SUMMARY_GRANULARITY:
+            LOGGER.warning(
+                "Ignoring configured granularity=%s for the daily summaries: that code "
+                "returns an empty payload for multi-day ranges. Using granularity=%s. "
+                "The detailed interval data is fetched separately and is unaffected.",
+                configured,
+                SUMMARY_GRANULARITY,
+            )
+        return SUMMARY_GRANULARITY
 
     def _build_history_range(self) -> Dict[str, str]:
         tzinfo = self._resolve_timezone(self._options.get(CONF_TIMEZONE, DEFAULT_TIMEZONE))

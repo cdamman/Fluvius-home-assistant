@@ -15,13 +15,11 @@ from .const import (
     CONF_GAS_UNIT,
     CONF_METER_SERIAL,
     CONF_METER_TYPE,
-    CONF_GRANULARITY,
     CONF_PASSWORD,
     CONF_TIMEZONE,
     CONF_VERBOSE_LOGGING,
     DEFAULT_DAYS_BACK,
     DEFAULT_GAS_UNIT,
-    DEFAULT_GRANULARITY,
     DEFAULT_METER_TYPE,
     DEFAULT_REMEMBER_ME,
     DEFAULT_TIMEZONE,
@@ -44,7 +42,6 @@ def _build_options(entry: ConfigEntry) -> dict:
     options = {
         CONF_TIMEZONE: entry.options.get(CONF_TIMEZONE, DEFAULT_TIMEZONE),
         CONF_DAYS_BACK: entry.options.get(CONF_DAYS_BACK, DEFAULT_DAYS_BACK),
-        CONF_GRANULARITY: entry.options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY),
         CONF_GAS_UNIT: entry.options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT),
         CONF_VERBOSE_LOGGING: entry.options.get(
             CONF_VERBOSE_LOGGING, DEFAULT_VERBOSE_LOGGING
