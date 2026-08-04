@@ -9,7 +9,8 @@ This repository packages a Home Assistant custom integration that logs in to Mij
 - Works with electricity and gas meters; gas payloads can use either the kWh values or the duplicated m3 volume readings from Fluvius
 - Sensors declared with `state_class=total_increasing`, so they qualify for the Energy dashboard
 - Monthly peak power sensor for electricity meters to feed capacity-tariff automations
-- Options flow to tweak timezone, lookback window, and Fluvius granularity without re-adding the entry
+- Detailed interval consumption imported as long-term statistics for the Energy dashboard: 15-minute for electricity, hourly for gas, at each meter's native recording resolution
+- Options flow to tweak timezone, history depth, meter type and gas unit without re-adding the entry
 - Diagnostics endpoint for privacy-safe troubleshooting
 - Basic config-flow tests to keep regressions in check
 
@@ -53,8 +54,7 @@ When a new version is released, replace the folder with the updated copy and res
 After the entry is created, use the **Options** button in the integration card to configure:
 
 - **Timezone**: IANA timezone used to build history date ranges (defaults to `Europe/Brussels`).
-- **Days back**: How many days of history to grab per refresh (1-31). Gas entries automatically enforce a 7-day minimum so fresh data appears even with Fluvius' 72-hour gas delay.
-- **Granularity**: Fluvius API granularity flag (`3` = quarter-hourly, `4` = daily). Gas entries are automatically forced to daily (`4`) because Fluvius does not expose quarter-hour data for gas meters.
+- **Days back**: How much history to keep (1-31). A single option drives both feeds: the daily sensors, which fetch their whole range in one request, and the detailed data behind the Energy dashboard statistics. Gas entries enforce a 7-day minimum so newly released measurements are not missed despite Fluvius' ~72-hour gas delay. The detailed feed needs one HTTP request per day, so the integration first checks which days are already in the statistics and requests only the rest -- in steady state that is the single day that just became available. It is capped at 14 days to bound the very first run.
 - **Meter type**: Switch between electricity and gas if you replace the hardware later. Changing this updates the config entry and reloads the integration.
 - **Gas unit**: Choose whether gas entries report kWh (default) or cubic meters. Switching this option clears cached statistics to avoid mixing units.
 
@@ -69,6 +69,9 @@ Changing any of these values triggers a config-entry reload.
 3. Optional sensors for tariff-specific reporting: `consumption_high`, `consumption_low`, `injection_high`, `injection_low`.
 4. A non-cumulative `sensor.fluvius_net_consumption_day` is available for daily comparisons but is not used directly in the Energy dashboard.
 5. Electricity meters also expose `sensor.fluvius_peak_power` (kW) so you can automate Belgium's capacity tariff follow-up.
+6. For detailed resolution, pick the **statistics** entries in the same picker: `fluvius:<ean>_quarter_hourly_consumption` and `fluvius:<ean>_quarter_hourly_injection` for electricity, `fluvius:<ean>_hourly_consumption` for gas (a gas meter only consumes, so it has no injection series). Note that gas is served on the Belgian *gas day*, 06:00 to 06:00, not on calendar days. These are external long-term statistics written directly with their real timestamps, so the history lands on the hours it actually happened rather than on the moment Home Assistant polled.
+
+   The `sensor.*_quarter_hourly_*` (electricity) and `sensor.*_hourly_*` (gas) entities carry **no state class** on purpose: their state is the total of the last day Fluvius published, which jumps to an unrelated value every day and would be read as a meter reset by the statistics engine. Use them for display and for the per-interval breakdown in their attributes; use the statistics above for the Energy dashboard.
 
 ### Diagnostics and Reauthentication
 - Gas data is only published by Fluvius after ~72 hours. The integration automatically fetches at least the past 7 days for gas meters so newly released measurements are not missed.
