@@ -11,13 +11,12 @@ tests_common = pytest.importorskip("tests.common")
 MockConfigEntry = tests_common.MockConfigEntry
 
 from custom_components.fluvius.const import (
+    CONF_DAYS_BACK,
     CONF_EAN,
     CONF_METER_SERIAL,
     CONF_METER_TYPE,
     DOMAIN,
     METER_TYPE_ELECTRICITY,
-    CONF_GRANULARITY,
-    DEFAULT_GRANULARITY
 )
 
 USER_INPUT = {
@@ -41,10 +40,10 @@ async def test_options_flow(hass):
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
         user_input={
-            CONF_GRANULARITY: "3",
+            CONF_DAYS_BACK: 10,
             CONF_METER_TYPE: METER_TYPE_ELECTRICITY,
         },
     )
 
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
-    assert result["data"][CONF_GRANULARITY] == "3"
+    assert result["data"][CONF_DAYS_BACK] == 10

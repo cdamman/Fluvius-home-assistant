@@ -74,8 +74,8 @@ async def test_sensors_populate_state(hass):
 
     registry = er.async_get(hass)
     entities = er.async_entries_for_config_entry(registry, entry.entry_id)
-    # 7 energy sensors + 1 peak power sensor for electricity meters
-    assert len(entities) == 8
+    # 7 energy sensors + 1 peak power sensor + 2 quarter-hourly sensors
+    assert len(entities) == 10
 
     entity_ids = {
         desc: registry.async_get_entity_id("sensor", "fluvius", f"{entry.entry_id}_{desc}")
