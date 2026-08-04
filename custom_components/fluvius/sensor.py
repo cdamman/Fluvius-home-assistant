@@ -199,7 +199,9 @@ async def async_setup_entry(
         ]
 
     entities = [
-        FluviusEnergySensor(description, coordinator, entry.entry_id, ean, meter_serial)
+        FluviusEnergySensor(
+            description, coordinator, entry.entry_id, ean, meter_serial, meter_type
+        )
         for description in descriptions
     ]
     if meter_type == METER_TYPE_ELECTRICITY:
@@ -228,6 +230,7 @@ class FluviusEnergySensor(CoordinatorEntity[FluviusEnergyDataUpdateCoordinator],
         entry_id: str,
         ean: str,
         meter_serial: str,
+        meter_type: str,
     ) -> None:
         super().__init__(coordinator)
         self.entity_description = description
@@ -239,11 +242,24 @@ class FluviusEnergySensor(CoordinatorEntity[FluviusEnergyDataUpdateCoordinator],
             model=meter_serial,
             name=f"Fluvius meter {meter_serial}",
         )
+        # A gas meter cannot inject. Reporting a flat 0 would read as a real
+        # measurement, so the entity is kept (dashboards referencing it survive)
+        # but marked unavailable.
+        self._not_applicable = (
+            meter_type == METER_TYPE_GAS
+            and description.metric.startswith(METRIC_INJECTION)
+        )
+
+    @property
+    def available(self) -> bool:
+        if self._not_applicable:
+            return False
+        return super().available
 
     @property
     def native_value(self) -> Optional[float]:
         data: FluviusCoordinatorData | None = self.coordinator.data
-        if data is None:
+        if data is None or self._not_applicable:
             return None
         metric = self.entity_description.metric
         if self.entity_description.is_lifetime:
@@ -258,7 +274,7 @@ class FluviusEnergySensor(CoordinatorEntity[FluviusEnergyDataUpdateCoordinator],
     @property
     def extra_state_attributes(self) -> Optional[Dict[str, Any]]:
         data: FluviusCoordinatorData | None = self.coordinator.data
-        if data is None or data.latest_summary is None:
+        if data is None or data.latest_summary is None or self._not_applicable:
             return None
         latest = data.latest_summary
         attributes: Dict[str, Any] = {
