@@ -311,7 +311,7 @@ class FluviusPeakPowerSensor(CoordinatorEntity[FluviusEnergyDataUpdateCoordinato
         if not data or not latest:
             return None
         history = {
-            peak.period_start.strftime("%Y-%m"): round(peak.value_kw, 3)
+            peak.spike_start.strftime("%Y-%m"): round(peak.value_kw, 3)
             for peak in data.peak_measurements[-12:]
         }
         return {
