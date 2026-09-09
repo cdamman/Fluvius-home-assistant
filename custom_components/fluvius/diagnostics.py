@@ -1,7 +1,8 @@
 """Diagnostics support for the Fluvius Energy integration."""
+
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -11,7 +12,6 @@ from .const import (
     CONF_METER_SERIAL,
     CONF_METER_TYPE,
     DEFAULT_METER_TYPE,
-    DOMAIN,
 )
 from .models import FluviusRuntimeData
 
@@ -19,7 +19,7 @@ from .models import FluviusRuntimeData
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant,
     entry: ConfigEntry,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Return diagnostics for a config entry without exposing secrets."""
 
     runtime_data: FluviusRuntimeData = entry.runtime_data
@@ -27,7 +27,7 @@ async def async_get_config_entry_diagnostics(
     store = runtime_data.store
     latest = coordinator.data.latest_summary if coordinator.data else None
 
-    diagnostics: Dict[str, Any] = {
+    diagnostics: dict[str, Any] = {
         "config": {
             "ean": entry.data[CONF_EAN],
             "meter_serial": entry.data[CONF_METER_SERIAL],

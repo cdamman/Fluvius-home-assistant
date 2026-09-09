@@ -1,25 +1,28 @@
 """Home Assistant custom integration for the Fluvius energy API."""
+
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 
 from .api import FluviusApiClient
 from .const import (
     CONF_DAYS_BACK,
-    CONF_EMAIL,
     CONF_EAN,
-    CONF_GRANULARITY,
+    CONF_EMAIL,
     CONF_GAS_UNIT,
+    CONF_GRANULARITY,
+    CONF_HISTORY_UNTIL,
     CONF_METER_SERIAL,
     CONF_METER_TYPE,
     CONF_PASSWORD,
     CONF_TIMEZONE,
+    CONF_VERBOSE_LOGGING,
     DEFAULT_DAYS_BACK,
-    DEFAULT_GRANULARITY,
     DEFAULT_GAS_UNIT,
+    DEFAULT_GRANULARITY,
     DEFAULT_METER_TYPE,
     DEFAULT_REMEMBER_ME,
     DEFAULT_TIMEZONE,
@@ -31,6 +34,7 @@ from .const import (
 from .coordinator import FluviusEnergyDataUpdateCoordinator
 from .http import async_create_fluvius_session
 from .models import FluviusRuntimeData
+from .statistics import FluviusStatistics, statistic_prefix
 from .store import FluviusEnergyStore
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -42,6 +46,8 @@ def _build_options(entry: ConfigEntry) -> dict:
         CONF_DAYS_BACK: entry.options.get(CONF_DAYS_BACK, DEFAULT_DAYS_BACK),
         CONF_GRANULARITY: entry.options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY),
         CONF_GAS_UNIT: entry.options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT),
+        CONF_VERBOSE_LOGGING: entry.options.get(CONF_VERBOSE_LOGGING, False),
+        CONF_HISTORY_UNTIL: entry.options.get(CONF_HISTORY_UNTIL),
     }
     return options
 
@@ -80,13 +86,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     store_unit = options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT)
     if meter_type != METER_TYPE_GAS:
         store_unit = GAS_UNIT_KWH
-    store = FluviusEnergyStore(hass, entry.entry_id, store_unit)
+    prefix = statistic_prefix(
+        entry.data[CONF_EAN], meter_type, store_unit, options[CONF_HISTORY_UNTIL]
+    )
+    store = FluviusEnergyStore(hass, prefix, store_unit)
     await store.async_load()
 
-    coordinator = FluviusEnergyDataUpdateCoordinator(hass, client, store)
+    statistics = FluviusStatistics(
+        hass,
+        prefix,
+        f"Fluvius {entry.data[CONF_METER_SERIAL]}",
+        "m3" if store_unit == "m3" else "kWh",
+    )
+    await statistics.async_load()
+    coordinator = FluviusEnergyDataUpdateCoordinator(hass, client, store, statistics)
     try:
         await coordinator.async_config_entry_first_refresh()
-    except ConfigEntryNotReady:
+    except ConfigEntryNotReady, ConfigEntryAuthFailed:
         raise
     except Exception as err:  # pragma: no cover - defensive
         raise ConfigEntryNotReady(str(err)) from err

@@ -1,8 +1,9 @@
 """Sensor platform for the Fluvius Energy integration."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Dict, Optional
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -21,17 +22,19 @@ from .api import FluviusPeakMeasurement, FluviusQuarterHourlyMeasurement
 from .const import (
     CONF_EAN,
     CONF_GAS_UNIT,
+    CONF_HISTORY_UNTIL,
     CONF_METER_SERIAL,
     CONF_METER_TYPE,
     DEFAULT_GAS_UNIT,
     DEFAULT_METER_TYPE,
     DOMAIN,
+    GAS_UNIT_CUBIC_METERS,
     METER_TYPE_ELECTRICITY,
     METER_TYPE_GAS,
-    GAS_UNIT_CUBIC_METERS,
 )
 from .coordinator import FluviusCoordinatorData, FluviusEnergyDataUpdateCoordinator
 from .models import FluviusRuntimeData
+from .statistics import statistic_prefix
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -50,7 +53,7 @@ SENSOR_TYPES: tuple[FluviusEnergySensorEntityDescription, ...] = (
         metric="consumption_total",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=3,
     ),
     FluviusEnergySensorEntityDescription(
@@ -60,7 +63,7 @@ SENSOR_TYPES: tuple[FluviusEnergySensorEntityDescription, ...] = (
         metric="consumption_high",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=3,
     ),
     FluviusEnergySensorEntityDescription(
@@ -70,7 +73,7 @@ SENSOR_TYPES: tuple[FluviusEnergySensorEntityDescription, ...] = (
         metric="consumption_low",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=3,
     ),
     FluviusEnergySensorEntityDescription(
@@ -80,7 +83,7 @@ SENSOR_TYPES: tuple[FluviusEnergySensorEntityDescription, ...] = (
         metric="injection_total",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=3,
     ),
     FluviusEnergySensorEntityDescription(
@@ -90,7 +93,7 @@ SENSOR_TYPES: tuple[FluviusEnergySensorEntityDescription, ...] = (
         metric="injection_high",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=3,
     ),
     FluviusEnergySensorEntityDescription(
@@ -100,7 +103,7 @@ SENSOR_TYPES: tuple[FluviusEnergySensorEntityDescription, ...] = (
         metric="injection_low",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.TOTAL_INCREASING,
+        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=3,
     ),
     FluviusEnergySensorEntityDescription(
@@ -126,15 +129,15 @@ PEAK_POWER_DESCRIPTION = SensorEntityDescription(
 )
 
 # Quarter-hourly (15-minute interval) sensor descriptions
-# These sensors show the DAILY TOTAL from quarter-hourly data
-# The detailed 15-minute breakdown is available in the attributes
+# These sensors display the latest interval, with the latest local day in attributes.
+# Historical Energy sources are imported separately by statistics.py.
 QUARTER_HOURLY_CONSUMPTION_DESCRIPTION = SensorEntityDescription(
     key="quarter_hourly_consumption",
     translation_key="quarter_hourly_consumption",
     name="Fluvius consumption (quarter-hourly)",
     device_class=SensorDeviceClass.ENERGY,
     native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-    state_class=SensorStateClass.TOTAL_INCREASING,
+    state_class=None,
     suggested_display_precision=3,
 )
 
@@ -144,7 +147,7 @@ QUARTER_HOURLY_INJECTION_DESCRIPTION = SensorEntityDescription(
     name="Fluvius injection (quarter-hourly)",
     device_class=SensorDeviceClass.ENERGY,
     native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-    state_class=SensorStateClass.TOTAL_INCREASING,
+    state_class=None,
     suggested_display_precision=3,
 )
 
@@ -169,7 +172,8 @@ async def async_setup_entry(
         descriptions = [
             replace(
                 description,
-                device_class=SensorDeviceClass.GAS,
+                device_class=SensorDeviceClass.GAS if description.is_lifetime else None,
+                state_class=SensorStateClass.TOTAL if description.is_lifetime else None,
                 native_unit_of_measurement=UnitOfVolume.CUBIC_METERS,
             )
             for description in SENSOR_TYPES
@@ -181,12 +185,20 @@ async def async_setup_entry(
     ]
     if meter_type == METER_TYPE_ELECTRICITY:
         entities.append(
-            FluviusPeakPowerSensor(PEAK_POWER_DESCRIPTION, coordinator, entry.entry_id, ean, meter_serial)
+            FluviusPeakPowerSensor(
+                PEAK_POWER_DESCRIPTION, coordinator, entry.entry_id, ean, meter_serial
+            )
         )
-    
+
     # Add quarter-hourly consumption and injection sensors
     quarter_hourly_consumption_desc = QUARTER_HOURLY_CONSUMPTION_DESCRIPTION
     quarter_hourly_injection_desc = QUARTER_HOURLY_INJECTION_DESCRIPTION
+    if meter_type == METER_TYPE_GAS:
+        quarter_hourly_consumption_desc = replace(
+            quarter_hourly_consumption_desc,
+            name="Fluvius consumption (hourly)",
+            translation_key="hourly_consumption",
+        )
     if use_gas_volume:
         quarter_hourly_consumption_desc = replace(
             quarter_hourly_consumption_desc,
@@ -208,6 +220,25 @@ async def async_setup_entry(
             quarter_hourly_injection_desc, coordinator, entry.entry_id, ean, meter_serial
         )
     )
+    unit = gas_unit if meter_type == METER_TYPE_GAS else "kwh"
+    prefix = statistic_prefix(ean, meter_type, unit, entry.options.get(CONF_HISTORY_UNTIL))
+    for entity in entities:
+        metric = entity.entity_description.key
+        if metric.startswith("quarter_hourly_"):
+            metric = metric.removeprefix("quarter_hourly_") + "_total"
+        if metric in {
+            "consumption_total",
+            "consumption_high",
+            "consumption_low",
+            "injection_total",
+            "injection_high",
+            "injection_low",
+        }:
+            entity._historical_statistic_id = f"{DOMAIN}:{prefix}_{metric}"
+    if meter_type == METER_TYPE_GAS:
+        entities = [
+            entity for entity in entities if "injection" not in entity.entity_description.key
+        ]
     async_add_entities(entities)
 
 
@@ -236,7 +267,7 @@ class FluviusEnergySensor(CoordinatorEntity[FluviusEnergyDataUpdateCoordinator],
         )
 
     @property
-    def native_value(self) -> Optional[float]:
+    def native_value(self) -> float | None:
         data: FluviusCoordinatorData | None = self.coordinator.data
         if data is None:
             return None
@@ -251,19 +282,22 @@ class FluviusEnergySensor(CoordinatorEntity[FluviusEnergyDataUpdateCoordinator],
         return round(value, 3)
 
     @property
-    def extra_state_attributes(self) -> Optional[Dict[str, Any]]:
+    def extra_state_attributes(self) -> dict[str, Any] | None:
         data: FluviusCoordinatorData | None = self.coordinator.data
         if data is None or data.latest_summary is None:
             return None
         latest = data.latest_summary
-        attributes: Dict[str, Any] = {
+        attributes: dict[str, Any] = {
+            "historical_statistic_id": getattr(self, "_historical_statistic_id", None),
             "latest_period_start": latest.start.isoformat(),
             "latest_period_end": latest.end.isoformat(),
             "latest_consumption": round(latest.metrics.get("consumption_total", 0.0), 3),
             "latest_injection": round(latest.metrics.get("injection_total", 0.0), 3),
         }
         if not self.entity_description.is_lifetime:
-            attributes["latest_net_consumption"] = round(latest.metrics.get("net_consumption", 0.0), 3)
+            attributes["latest_net_consumption"] = round(
+                latest.metrics.get("net_consumption", 0.0), 3
+            )
         return attributes
 
 
@@ -298,14 +332,14 @@ class FluviusPeakPowerSensor(CoordinatorEntity[FluviusEnergyDataUpdateCoordinato
         return data.peak_measurements[-1]
 
     @property
-    def native_value(self) -> Optional[float]:
+    def native_value(self) -> float | None:
         latest = self._latest_peak()
         if not latest:
             return None
         return round(latest.value_kw, 3)
 
     @property
-    def extra_state_attributes(self) -> Optional[Dict[str, Any]]:
+    def extra_state_attributes(self) -> dict[str, Any] | None:
         data: FluviusCoordinatorData | None = self.coordinator.data
         latest = self._latest_peak()
         if not data or not latest:
@@ -357,36 +391,42 @@ class FluviusQuarterHourlyConsumptionSensor(
         return data.quarter_hourly_measurements[-1]
 
     @property
-    def native_value(self) -> Optional[float]:
-        """Return the cumulative consumption from all available quarter-hourly data."""
+    def native_value(self) -> float | None:
+        """Return the latest interval, without presenting a rolling sum as a meter."""
         data: FluviusCoordinatorData | None = self.coordinator.data
         if not data or not data.quarter_hourly_measurements:
             return None
-        # Sum all consumption values - this creates a total that increases over time
-        total = sum(m.consumption for m in data.quarter_hourly_measurements)
-        return round(total, 3)
+        return round(data.quarter_hourly_measurements[-1].consumption, 3)
 
     @property
-    def extra_state_attributes(self) -> Optional[Dict[str, Any]]:
+    def extra_state_attributes(self) -> dict[str, Any] | None:
         data: FluviusCoordinatorData | None = self.coordinator.data
         latest = self._latest_measurement()
         if not data or not latest:
             return None
-        
-        # Include the last 96 intervals (24 hours of 15-minute data)
-        recent_intervals = data.quarter_hourly_measurements[-96:]
-        hourly_data = {
-            m.start.isoformat(): round(m.consumption, 3)
-            for m in recent_intervals
-        }
-        
+
+        # Select a local calendar day, including all intervals on DST transition days.
+        from zoneinfo import ZoneInfo
+
+        from .const import DEFAULT_TIMEZONE
+
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+        day = latest.start.astimezone(tz).date()
+        recent_intervals = [
+            m for m in data.quarter_hourly_measurements if m.start.astimezone(tz).date() == day
+        ]
+        hourly_data = {m.start.isoformat(): round(m.consumption, 3) for m in recent_intervals}
+
         # Calculate totals for the last day of data
         last_day_consumption = sum(m.consumption for m in recent_intervals)
-        
+
         # Get the date range of available data
-        first_measurement = data.quarter_hourly_measurements[0] if data.quarter_hourly_measurements else None
-        
+        first_measurement = (
+            data.quarter_hourly_measurements[0] if data.quarter_hourly_measurements else None
+        )
+
         return {
+            "historical_statistic_id": getattr(self, "_historical_statistic_id", None),
             "period_start": latest.start.isoformat(),
             "period_end": latest.end.isoformat(),
             "data_from": first_measurement.start.isoformat() if first_measurement else None,
@@ -432,36 +472,42 @@ class FluviusQuarterHourlyInjectionSensor(
         return data.quarter_hourly_measurements[-1]
 
     @property
-    def native_value(self) -> Optional[float]:
-        """Return the cumulative injection from all available quarter-hourly data."""
+    def native_value(self) -> float | None:
+        """Return the latest injection interval."""
         data: FluviusCoordinatorData | None = self.coordinator.data
         if not data or not data.quarter_hourly_measurements:
             return None
-        # Sum all injection values - this creates a total that increases over time
-        total = sum(m.injection for m in data.quarter_hourly_measurements)
-        return round(total, 3)
+        return round(data.quarter_hourly_measurements[-1].injection, 3)
 
     @property
-    def extra_state_attributes(self) -> Optional[Dict[str, Any]]:
+    def extra_state_attributes(self) -> dict[str, Any] | None:
         data: FluviusCoordinatorData | None = self.coordinator.data
         latest = self._latest_measurement()
         if not data or not latest:
             return None
-        
-        # Include the last 96 intervals (24 hours of 15-minute data)
-        recent_intervals = data.quarter_hourly_measurements[-96:]
-        hourly_data = {
-            m.start.isoformat(): round(m.injection, 3)
-            for m in recent_intervals
-        }
-        
+
+        # Select a local calendar day, including all intervals on DST transition days.
+        from zoneinfo import ZoneInfo
+
+        from .const import DEFAULT_TIMEZONE
+
+        tz = ZoneInfo(DEFAULT_TIMEZONE)
+        day = latest.start.astimezone(tz).date()
+        recent_intervals = [
+            m for m in data.quarter_hourly_measurements if m.start.astimezone(tz).date() == day
+        ]
+        hourly_data = {m.start.isoformat(): round(m.injection, 3) for m in recent_intervals}
+
         # Calculate totals for the last day of data
         last_day_injection = sum(m.injection for m in recent_intervals)
-        
+
         # Get the date range of available data
-        first_measurement = data.quarter_hourly_measurements[0] if data.quarter_hourly_measurements else None
-        
+        first_measurement = (
+            data.quarter_hourly_measurements[0] if data.quarter_hourly_measurements else None
+        )
+
         return {
+            "historical_statistic_id": getattr(self, "_historical_statistic_id", None),
             "period_start": latest.start.isoformat(),
             "period_end": latest.end.isoformat(),
             "data_from": first_measurement.start.isoformat() if first_measurement else None,

@@ -1,22 +1,24 @@
-"""DataUpdateCoordinator for the Fluvius Energy integration."""
+"""Fetch delayed Fluvius readings and publish their historical statistics."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
-import time
-from typing import Dict, List
+from dataclasses import dataclass
 
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
     FluviusApiClient,
     FluviusApiError,
+    FluviusAuthenticationError,
     FluviusDailySummary,
     FluviusPeakMeasurement,
     FluviusQuarterHourlyMeasurement,
 )
 from .const import DEFAULT_UPDATE_INTERVAL
+from .statistics import FluviusStatistics
 from .store import FluviusEnergyStore
 
 LOGGER = logging.getLogger(__name__)
@@ -27,9 +29,9 @@ class FluviusCoordinatorData:
     """Container returned by the coordinator."""
 
     latest_summary: FluviusDailySummary | None
-    lifetime_totals: Dict[str, float]
+    lifetime_totals: dict[str, float]
     peak_measurements: list[FluviusPeakMeasurement]
-    quarter_hourly_measurements: List[FluviusQuarterHourlyMeasurement]
+    quarter_hourly_measurements: list[FluviusQuarterHourlyMeasurement]
 
 
 class FluviusEnergyDataUpdateCoordinator(DataUpdateCoordinator[FluviusCoordinatorData]):
@@ -40,85 +42,57 @@ class FluviusEnergyDataUpdateCoordinator(DataUpdateCoordinator[FluviusCoordinato
         hass: HomeAssistant,
         client: FluviusApiClient,
         store: FluviusEnergyStore,
+        statistics: FluviusStatistics | None = None,
     ) -> None:
         super().__init__(
-            hass,
-            LOGGER,
-            name="Fluvius energy coordinator",
-            update_interval=DEFAULT_UPDATE_INTERVAL,
+            hass, LOGGER, name="Fluvius energy coordinator", update_interval=DEFAULT_UPDATE_INTERVAL
         )
         self._client = client
         self._store = store
+        self._statistics = statistics
 
     async def _async_update_data(self) -> FluviusCoordinatorData:
-        start_time = time.monotonic()
-        LOGGER.debug("=== FLUVIUS UPDATE START ===")
-        
-        # Step 1: Fetch daily summaries and peak power
+        summaries, peaks, intervals = [], [], []
+        errors = []
         try:
-            LOGGER.debug("Step 1/3: Fetching daily consumption summaries and peak power...")
-            summaries, peak_measurements = await self._client.fetch_daily_summaries_with_spikes()
-            LOGGER.debug(
-                "Step 1/3: SUCCESS - Received %d daily summaries, %d peak measurements",
-                len(summaries),
-                len(peak_measurements),
-            )
+            summaries, peaks = await self._client.fetch_daily_summaries_with_spikes()
+        except FluviusAuthenticationError as err:
+            raise ConfigEntryAuthFailed(str(err)) from err
         except FluviusApiError as err:
-            elapsed = time.monotonic() - start_time
-            LOGGER.error(
-                "=== FLUVIUS UPDATE FAILED (%.2fs) === Step 1/3 failed: %s. "
-                "Check the errors above for more details. Common causes: "
-                "1) Authentication expired - try reloading the integration, "
-                "2) Fluvius service is temporarily unavailable, "
-                "3) Invalid EAN or meter serial number.",
-                elapsed,
-                err,
-            )
-            raise UpdateFailed(str(err)) from err
+            errors.append(err)
 
-        if not summaries:
-            LOGGER.warning(
-                "Step 1/3: WARNING - No daily consumption data returned. "
-                "This can happen if: 1) Your meter is newly installed, "
-                "2) Fluvius hasn't processed recent data yet, "
-                "3) The configured date range has no data."
-            )
+        if self._client.detailed_history:
+            try:
+                intervals = await self._client.fetch_quarter_hourly_consumption()
+            except FluviusAuthenticationError as err:
+                raise ConfigEntryAuthFailed(str(err)) from err
+            except FluviusApiError as err:
+                errors.append(err)
 
-        # Step 2: Fetch quarter-hourly data (non-blocking on failure)
-        quarter_hourly: list[FluviusQuarterHourlyMeasurement] = []
-        try:
-            LOGGER.debug("Step 2/3: Fetching quarter-hourly (15-minute) consumption data...")
-            quarter_hourly = await self._client.fetch_quarter_hourly_consumption()
-            LOGGER.debug("Step 2/3: SUCCESS - Received %d quarter-hourly intervals", len(quarter_hourly))
-        except FluviusApiError as err:
-            LOGGER.warning(
-                "Step 2/3: SKIPPED - Could not fetch quarter-hourly data: %s. "
-                "This is non-fatal; daily data will still work. "
-                "Quarter-hourly data may not be available for all meters.",
-                err,
-            )
+        if errors and not summaries and not intervals:
+            raise UpdateFailed(str(errors[0])) from errors[0]
+        for err in errors:
+            LOGGER.debug("Some Fluvius data is temporarily unavailable: %s", err)
 
-        # Step 3: Process and store data
-        LOGGER.debug("Step 3/3: Processing and storing %d summaries...", len(summaries))
+        if self._statistics:
+            await self._statistics.async_update(summaries, intervals)
         for summary in summaries:
             await self._store.async_process_summary(summary.day_id, summary.metrics)
 
-        totals = self._store.get_lifetime_totals()
-        latest_summary = summaries[-1] if summaries else None
-        
-        elapsed = time.monotonic() - start_time
-        LOGGER.debug(
-            "=== FLUVIUS UPDATE COMPLETE (%.2fs) === "
-            "Daily summaries: %d, Peak measurements: %d, Quarter-hourly intervals: %d",
-            elapsed,
-            len(summaries),
-            len(peak_measurements),
-            len(quarter_hourly),
-        )
-        
+        previous = self.data
+        latest = summaries[-1] if summaries else (previous.latest_summary if previous else None)
+        if latest is None and intervals:
+            # Detailed-only meters still get a meaningful latest-period reading.
+            item = intervals[-1]
+            latest = FluviusDailySummary(item.start.isoformat(), item.start, item.end, item.metrics)
+        if not summaries and not intervals:
+            LOGGER.debug("No new published Fluvius readings; keeping the last available data")
         return FluviusCoordinatorData(
-            latest_summary=latest_summary,
-            lifetime_totals=totals,
-            peak_measurements=peak_measurements,
-            quarter_hourly_measurements=quarter_hourly,
+            latest_summary=latest,
+            lifetime_totals=self._statistics.get_totals()
+            if self._statistics
+            else self._store.get_lifetime_totals(),
+            peak_measurements=peaks or (previous.peak_measurements if previous else []),
+            quarter_hourly_measurements=intervals
+            or (previous.quarter_hourly_measurements if previous else []),
         )

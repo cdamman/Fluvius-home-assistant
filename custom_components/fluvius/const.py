@@ -1,7 +1,9 @@
 """Constants for the Fluvius Energy integration."""
+
 from __future__ import annotations
 
 from datetime import timedelta
+
 from homeassistant.const import Platform
 
 DOMAIN = "fluvius"
@@ -17,6 +19,7 @@ CONF_REMEMBER_ME = "remember_me"
 CONF_METER_TYPE = "meter_type"
 CONF_GAS_UNIT = "gas_unit"
 CONF_VERBOSE_LOGGING = "verbose_logging"
+CONF_HISTORY_UNTIL = "history_until"
 
 DEFAULT_TIMEZONE = "Europe/Brussels"
 DEFAULT_DAYS_BACK = 7
@@ -35,9 +38,9 @@ METER_TYPE_OPTIONS = (METER_TYPE_ELECTRICITY, METER_TYPE_GAS)
 GAS_MIN_LOOKBACK_DAYS = 7
 GAS_SUPPORTED_GRANULARITY = "4"
 
-# Hourly/quarter-hourly granularity for detailed consumption data
-HOURLY_GRANULARITY = "1"  # 15-minute intervals
-DEFAULT_HOURLY_DAYS_BACK = 1  # Fetch today's data by default
+# Values used by the Mijn Fluvius meter-measurement-history endpoint.
+QUARTER_HOURLY_GRANULARITY = "1"
+HOURLY_GRANULARITY = "2"
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
