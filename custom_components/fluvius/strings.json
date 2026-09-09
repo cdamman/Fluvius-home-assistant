@@ -43,15 +43,13 @@
         "data": {
           "timezone": "Timezone",
           "days_back": "Days back",
-          "granularity": "Granularity",
           "meter_type": "Meter type",
           "gas_unit": "Gas unit",
           "verbose_logging": "Verbose logging"
         },
         "data_description": {
           "timezone": "Used to build the date range when requesting history from Fluvius.",
-          "days_back": "Number of days to fetch per refresh. Gas meters always request at least seven days.",
-          "granularity": "Fluvius API granularity code (3 quarter-hour, 4 daily). Gas meters always use daily.",
+          "days_back": "How much history to keep (1-31). Drives both the daily sensors and the detailed data behind the Energy dashboard statistics. Gas meters always cover at least seven days. Only days that are not yet imported are actually requested, so after the first run a refresh usually costs a single request; the detailed feed is capped at 14 days.",
           "meter_type": "Choose whether this entry targets an electricity or gas meter.",
           "gas_unit": "For gas meters, pick whether to store energy (kWh) or volume (m3).",
           "verbose_logging": "Enable detailed debug logging for troubleshooting API issues. Logs will show full request/response details."
@@ -93,6 +91,12 @@
       },
       "peak_power": {
         "name": "Peak power"
+      },
+      "hourly_consumption": {
+        "name": "Consumption (hourly)"
+      },
+      "hourly_injection": {
+        "name": "Injection (hourly)"
       },
       "quarter_hourly_consumption": {
         "name": "Consumption (quarter-hourly)"

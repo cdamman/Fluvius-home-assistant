@@ -210,7 +210,7 @@ def test_quarter_hourly_payload_parsing():
     """Ensure the quarter-hourly payload is correctly parsed into measurements."""
 
     client = _make_client()
-    measurements = client._quarter_hourly_from_payload(  # pylint: disable=protected-access
+    measurements = client._interval_from_payload(  # pylint: disable=protected-access
         [
             {
                 "d": "2025-11-30T23:00:00Z",
@@ -244,7 +244,7 @@ def test_quarter_hourly_sorted_by_start_time():
     """Verify quarter-hourly measurements are sorted chronologically."""
 
     client = _make_client()
-    measurements = client._quarter_hourly_from_payload(  # pylint: disable=protected-access
+    measurements = client._interval_from_payload(  # pylint: disable=protected-access
         [
             {
                 "d": "2025-12-01T01:00:00Z",
@@ -267,7 +267,7 @@ def test_quarter_hourly_gas_uses_kwh_only():
     """Ensure gas quarter-hourly readings drop m3 and keep kWh values."""
 
     client = _make_client(meter_type=METER_TYPE_GAS)
-    measurements = client._quarter_hourly_from_payload(  # pylint: disable=protected-access
+    measurements = client._interval_from_payload(  # pylint: disable=protected-access
         [
             {
                 "d": "2025-11-30T23:00:00Z",
@@ -291,7 +291,7 @@ def test_quarter_hourly_gas_can_use_cubic_meters():
         meter_type=METER_TYPE_GAS,
         options={CONF_GAS_UNIT: GAS_UNIT_CUBIC_METERS},
     )
-    measurements = client._quarter_hourly_from_payload(  # pylint: disable=protected-access
+    measurements = client._interval_from_payload(  # pylint: disable=protected-access
         [
             {
                 "d": "2025-11-30T23:00:00Z",

@@ -27,7 +27,6 @@ from .const import (
     CONF_DAYS_BACK,
     CONF_EMAIL,
     CONF_EAN,
-    CONF_GRANULARITY,
     CONF_GAS_UNIT,
     CONF_METER_SERIAL,
     CONF_METER_TYPE,
@@ -36,14 +35,12 @@ from .const import (
     CONF_VERBOSE_LOGGING,
     DEFAULT_DAYS_BACK,
     DEFAULT_GAS_UNIT,
-    DEFAULT_GRANULARITY,
     DEFAULT_METER_TYPE,
     DEFAULT_TIMEZONE,
     DEFAULT_VERBOSE_LOGGING,
     DOMAIN,
     METER_TYPE_ELECTRICITY,
     METER_TYPE_GAS,
-    GAS_SUPPORTED_GRANULARITY,
     GAS_UNIT_CUBIC_METERS,
     GAS_UNIT_KWH,
 )
@@ -169,16 +166,12 @@ class FluviusOptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
         current_meter_type = self._entry.data.get(CONF_METER_TYPE, DEFAULT_METER_TYPE)
-        current_granularity = self._entry.options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY)
         current_gas_unit = self._entry.options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT)
-        if current_meter_type == METER_TYPE_GAS:
-            current_granularity = GAS_SUPPORTED_GRANULARITY
 
         if user_input is not None:
             new_meter_type = user_input.pop(CONF_METER_TYPE, current_meter_type)
             gas_unit = user_input.pop(CONF_GAS_UNIT, current_gas_unit)
             if new_meter_type == METER_TYPE_GAS:
-                user_input[CONF_GRANULARITY] = GAS_SUPPORTED_GRANULARITY
                 user_input[CONF_GAS_UNIT] = gas_unit
             else:
                 user_input.pop(CONF_GAS_UNIT, None)
@@ -190,13 +183,6 @@ class FluviusOptionsFlowHandler(config_entries.OptionsFlow):
                 self._entry = self.hass.config_entries.async_get_entry(self._entry.entry_id)
             return self.async_create_entry(data=user_input)
 
-        granularity_options = [
-            SelectOptionDict(value="3", label="Quarter-hour"),
-            SelectOptionDict(value=DEFAULT_GRANULARITY, label="Daily"),
-        ]
-        if current_meter_type == METER_TYPE_GAS:
-            granularity_options = [SelectOptionDict(value=GAS_SUPPORTED_GRANULARITY, label="Daily")]
-
         schema_fields = {
             vol.Required(
                 CONF_TIMEZONE,
@@ -207,15 +193,6 @@ class FluviusOptionsFlowHandler(config_entries.OptionsFlow):
                 default=self._entry.options.get(CONF_DAYS_BACK, DEFAULT_DAYS_BACK),
             ): NumberSelector(
                 NumberSelectorConfig(min=1, max=31, mode="box"),
-            ),
-            vol.Required(
-                CONF_GRANULARITY,
-                default=current_granularity,
-            ): SelectSelector(
-                SelectSelectorConfig(
-                    options=granularity_options,
-                    mode="dropdown",
-                )
             ),
             vol.Required(
                 CONF_METER_TYPE,

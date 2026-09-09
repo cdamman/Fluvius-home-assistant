@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
@@ -11,19 +12,20 @@ from .const import (
     CONF_DAYS_BACK,
     CONF_EMAIL,
     CONF_EAN,
-    CONF_GRANULARITY,
     CONF_GAS_UNIT,
     CONF_METER_SERIAL,
     CONF_METER_TYPE,
     CONF_PASSWORD,
     CONF_TIMEZONE,
+    CONF_VERBOSE_LOGGING,
     DEFAULT_DAYS_BACK,
-    DEFAULT_GRANULARITY,
     DEFAULT_GAS_UNIT,
     DEFAULT_METER_TYPE,
     DEFAULT_REMEMBER_ME,
     DEFAULT_TIMEZONE,
+    DEFAULT_VERBOSE_LOGGING,
     DOMAIN,
+    GAS_UNIT_CUBIC_METERS,
     GAS_UNIT_KWH,
     METER_TYPE_GAS,
     PLATFORMS,
@@ -40,10 +42,23 @@ def _build_options(entry: ConfigEntry) -> dict:
     options = {
         CONF_TIMEZONE: entry.options.get(CONF_TIMEZONE, DEFAULT_TIMEZONE),
         CONF_DAYS_BACK: entry.options.get(CONF_DAYS_BACK, DEFAULT_DAYS_BACK),
-        CONF_GRANULARITY: entry.options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY),
         CONF_GAS_UNIT: entry.options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT),
+        CONF_VERBOSE_LOGGING: entry.options.get(
+            CONF_VERBOSE_LOGGING, DEFAULT_VERBOSE_LOGGING
+        ),
     }
     return options
+
+
+def _statistics_unit(meter_type: str, options: dict) -> str:
+    """Return the unit the interval statistics are expressed in."""
+
+    if (
+        meter_type == METER_TYPE_GAS
+        and options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT) == GAS_UNIT_CUBIC_METERS
+    ):
+        return UnitOfVolume.CUBIC_METERS
+    return UnitOfEnergy.KILO_WATT_HOUR
 
 
 async def async_setup(hass: HomeAssistant, _: dict) -> bool:
@@ -83,7 +98,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     store = FluviusEnergyStore(hass, entry.entry_id, store_unit)
     await store.async_load()
 
-    coordinator = FluviusEnergyDataUpdateCoordinator(hass, client, store)
+    coordinator = FluviusEnergyDataUpdateCoordinator(
+        hass,
+        client,
+        store,
+        ean=entry.data[CONF_EAN],
+        meter_type=meter_type,
+        statistics_unit=_statistics_unit(meter_type, options),
+    )
     try:
         await coordinator.async_config_entry_first_refresh()
     except ConfigEntryNotReady:
