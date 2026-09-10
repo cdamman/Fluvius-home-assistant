@@ -1,5 +1,8 @@
 {
   "name": "Fluvius",
   "render_readme": true,
-  "country": ["BE"]
+  "country": [
+    "BE"
+  ],
+  "homeassistant": "2026.5.0"
 }
