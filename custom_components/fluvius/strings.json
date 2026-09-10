@@ -3,20 +3,22 @@
     "step": {
       "user": {
         "title": "Connect to Fluvius",
-        "description": "Enter the credentials that you also use on mijn.fluvius.be and select the meter you want to expose to Home Assistant.",
+        "description": "Enter your personal Mijn Fluvius email and password and the meter details. Professional accounts requiring eID or itsme are not supported.",
         "data": {
           "email": "Email address",
           "password": "Password",
           "ean": "EAN number",
           "meter_serial": "Meter serial number",
-          "meter_type": "Meter type"
+          "meter_type": "Meter type",
+          "gas_unit": "Gas unit"
         },
         "data_description": {
           "email": "Use the same email address you provide on mijn.fluvius.be.",
-          "password": "Stored securely and exchanged for a short-lived Fluvius access token.",
+          "password": "Saved in the Home Assistant configuration and used to obtain a short-lived Fluvius token.",
           "ean": "18-digit identifier printed on your utility bill (per meter).",
           "meter_serial": "Matches the serial number shown in the Fluvius portal (for example 1SAG...).",
-          "meter_type": "Create one entry per meter and choose whether it is an electricity or a gas meter."
+          "meter_type": "Create one entry per meter and choose whether it is an electricity or a gas meter.",
+          "gas_unit": "Gas only: choose kWh or m3 before the first import. Values are read in that unit; the integration does not convert them."
         }
       },
       "reauth_confirm": {
@@ -27,32 +29,16 @@
           "password": "Password",
           "ean": "EAN number",
           "meter_serial": "Meter serial number",
-          "meter_type": "Meter type"
+          "meter_type": "Meter type",
+          "gas_unit": "Gas unit"
         },
         "data_description": {
           "email": "Update the email if your Fluvius login changed.",
           "password": "Enter the new password so the integration can refresh its session.",
           "ean": "Confirm the same EAN that this entry manages.",
           "meter_serial": "Confirm the meter serial stored in Fluvius.",
-          "meter_type": "If you swapped hardware, pick the correct meter type before saving."
-        }
-      },
-      "options": {
-        "title": "Fluvius Options",
-        "description": "Configure history window, granularity, meter type, and gas unit.",
-        "data": {
-          "timezone": "Timezone",
-          "days_back": "Days back",
-          "meter_type": "Meter type",
-          "gas_unit": "Gas unit",
-          "verbose_logging": "Verbose logging"
-        },
-        "data_description": {
-          "timezone": "Used to build the date range when requesting history from Fluvius.",
-          "days_back": "How much history to keep (1-31). Drives both the daily sensors and the detailed data behind the Energy dashboard statistics. Gas meters always cover at least seven days. Only days that are not yet imported are actually requested, so after the first run a refresh usually costs a single request; the detailed feed is capped at 14 days.",
-          "meter_type": "Choose whether this entry targets an electricity or gas meter.",
-          "gas_unit": "For gas meters, pick whether to store energy (kWh) or volume (m3).",
-          "verbose_logging": "Enable detailed debug logging for troubleshooting API issues. Logs will show full request/response details."
+          "meter_type": "If you swapped hardware, pick the correct meter type before saving.",
+          "gas_unit": "Gas only: choose kWh or m3 before the first import. Values are read in that unit; the integration does not convert them."
         }
       }
     },
@@ -63,7 +49,8 @@
     },
     "abort": {
       "already_configured": "This Fluvius EAN is already configured.",
-      "reauth_successful": "Credentials updated successfully."
+      "reauth_successful": "Credentials updated successfully.",
+      "wrong_account": "Reauthentication must use the same EAN."
     }
   },
   "entity": {
@@ -92,18 +79,44 @@
       "peak_power": {
         "name": "Peak power"
       },
-      "hourly_consumption": {
-        "name": "Consumption (hourly)"
-      },
-      "hourly_injection": {
-        "name": "Injection (hourly)"
-      },
       "quarter_hourly_consumption": {
         "name": "Consumption (quarter-hourly)"
       },
       "quarter_hourly_injection": {
         "name": "Injection (quarter-hourly)"
+      },
+      "hourly_consumption": {
+        "name": "Consumption (hourly)"
       }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Fluvius Options",
+        "description": "Configure history window, granularity, meter type, and gas unit.",
+        "data": {
+          "timezone": "Timezone",
+          "days_back": "Days back",
+          "granularity": "Granularity",
+          "meter_type": "Meter type",
+          "gas_unit": "Gas unit",
+          "verbose_logging": "Verbose logging",
+          "history_until": "Import history until (optional)"
+        },
+        "data_description": {
+          "timezone": "Used to build the date range when requesting history from Fluvius.",
+          "days_back": "Number of days to fetch per refresh. Gas meters always request at least seven days.",
+          "granularity": "Daily totals, electricity quarter-hours, or gas hours. Detailed readings must be enabled in Mijn Fluvius.",
+          "meter_type": "Choose whether this entry targets an electricity or gas meter.",
+          "gas_unit": "For gas meters, pick whether to store energy (kWh) or volume (m3).",
+          "verbose_logging": "Log request dates and status for troubleshooting. Credentials and response bodies are not logged.",
+          "history_until": "Exclusive cutoff for combining with a P1 meter. Only intervals ending at or before this time are imported. Clear this field to resume current history."
+        }
+      }
+    },
+    "error": {
+      "invalid_history": "Enter a valid timezone and a history end time in the past."
     }
   }
 }
