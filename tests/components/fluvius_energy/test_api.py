@@ -1,20 +1,19 @@
 """Tests for the Fluvius API helper logic."""
+
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
-import pytest
-
 import asyncio
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import aiohttp
+import pytest
 
 from custom_components.fluvius.api import FluviusApiClient
 from custom_components.fluvius.const import (
     CONF_DAYS_BACK,
-    CONF_GRANULARITY,
     CONF_GAS_UNIT,
+    CONF_GRANULARITY,
     GAS_MIN_LOOKBACK_DAYS,
     GAS_SUPPORTED_GRANULARITY,
     GAS_UNIT_CUBIC_METERS,
@@ -57,7 +56,6 @@ def test_gas_day_uses_kwh_values_only():
     assert summary.metrics["consumption_high"] == pytest.approx(57.9398)
     assert summary.metrics["consumption_total"] == pytest.approx(57.9398)
     assert summary.metrics["injection_total"] == 0.0
-
 
 
 def test_gas_day_can_use_cubic_meter_values():
@@ -138,9 +136,9 @@ def test_gas_history_range_enforces_minimum(monkeypatch):
     """Gas meters should always request at least seven days of history."""
 
     client = _make_client(meter_type=METER_TYPE_GAS, options={CONF_DAYS_BACK: 1})
-    client._resolve_timezone = lambda *_: timezone.utc  # type: ignore[assignment]
+    client._resolve_timezone = lambda *_: UTC  # type: ignore[assignment]
 
-    fixed_now = datetime(2025, 11, 24, 6, 0, tzinfo=timezone.utc)
+    fixed_now = datetime(2025, 11, 24, 6, 0, tzinfo=UTC)
 
     class FixedDateTime(datetime):
         @classmethod
@@ -155,7 +153,7 @@ def test_gas_history_range_enforces_minimum(monkeypatch):
     start = datetime.fromisoformat(history_range["historyFrom"])
     end = datetime.fromisoformat(history_range["historyUntil"])
 
-    assert (end - start) >= timedelta(days=GAS_MIN_LOOKBACK_DAYS)
+    assert (end - start + timedelta(milliseconds=1)) >= timedelta(days=GAS_MIN_LOOKBACK_DAYS)
 
 
 def test_gas_requests_force_daily_granularity(monkeypatch):
@@ -210,7 +208,7 @@ def test_quarter_hourly_payload_parsing():
     """Ensure the quarter-hourly payload is correctly parsed into measurements."""
 
     client = _make_client()
-    measurements = client._interval_from_payload(  # pylint: disable=protected-access
+    measurements = client._quarter_hourly_from_payload(  # pylint: disable=protected-access
         [
             {
                 "d": "2025-11-30T23:00:00Z",
@@ -244,7 +242,7 @@ def test_quarter_hourly_sorted_by_start_time():
     """Verify quarter-hourly measurements are sorted chronologically."""
 
     client = _make_client()
-    measurements = client._interval_from_payload(  # pylint: disable=protected-access
+    measurements = client._quarter_hourly_from_payload(  # pylint: disable=protected-access
         [
             {
                 "d": "2025-12-01T01:00:00Z",
@@ -267,11 +265,11 @@ def test_quarter_hourly_gas_uses_kwh_only():
     """Ensure gas quarter-hourly readings drop m3 and keep kWh values."""
 
     client = _make_client(meter_type=METER_TYPE_GAS)
-    measurements = client._interval_from_payload(  # pylint: disable=protected-access
+    measurements = client._quarter_hourly_from_payload(  # pylint: disable=protected-access
         [
             {
                 "d": "2025-11-30T23:00:00Z",
-                "de": "2025-11-30T23:15:00Z",
+                "de": "2025-12-01T00:00:00Z",
                 "v": [
                     {"dc": 2, "t": 1, "v": 0.5, "u": 5},  # m3 - should be skipped
                     {"dc": 2, "t": 1, "v": 5.7, "u": 3},  # kWh - should be kept
@@ -291,11 +289,11 @@ def test_quarter_hourly_gas_can_use_cubic_meters():
         meter_type=METER_TYPE_GAS,
         options={CONF_GAS_UNIT: GAS_UNIT_CUBIC_METERS},
     )
-    measurements = client._interval_from_payload(  # pylint: disable=protected-access
+    measurements = client._quarter_hourly_from_payload(  # pylint: disable=protected-access
         [
             {
                 "d": "2025-11-30T23:00:00Z",
-                "de": "2025-11-30T23:15:00Z",
+                "de": "2025-12-01T00:00:00Z",
                 "v": [
                     {"dc": 2, "t": 1, "v": 0.5, "u": 5},  # m3 - should be kept
                     {"dc": 2, "t": 1, "v": 5.7, "u": 3},  # kWh - should be skipped

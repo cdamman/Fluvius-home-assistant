@@ -1,39 +1,38 @@
 """HTTP client helpers for the Fluvius Energy integration."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import logging
-from typing import Any, Dict, List, Optional, Set
+import math
+import time
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import aiohttp
 
+from .auth import FluviusAuthError, async_get_bearer_token
 from .const import (
     ALL_METRICS,
     CONF_DAYS_BACK,
-    CONF_GRANULARITY,
     CONF_GAS_UNIT,
+    CONF_GRANULARITY,
+    CONF_HISTORY_UNTIL,
     CONF_TIMEZONE,
     CONF_VERBOSE_LOGGING,
     DEFAULT_DAYS_BACK,
-    DEFAULT_GRANULARITY,
     DEFAULT_GAS_UNIT,
+    DEFAULT_GRANULARITY,
     DEFAULT_METER_TYPE,
     DEFAULT_TIMEZONE,
     DEFAULT_VERBOSE_LOGGING,
-    GAS_DAY_START_HOUR,
-    GAS_MIN_INTERVAL_LOOKBACK_DAYS,
     GAS_MIN_LOOKBACK_DAYS,
     GAS_UNIT_CUBIC_METERS,
-    INTERVAL_EXTRA_PARAMS,
     INTERVAL_GRANULARITY_CANDIDATES,
     INTERVAL_MINUTES_BY_METER_TYPE,
-    MAX_INTERVAL_DAYS_BACK,
     METER_TYPE_ELECTRICITY,
     METER_TYPE_GAS,
-    SUMMARY_GRANULARITY,
 )
-from .auth import FluviusAuthError, async_get_bearer_token
 
 try:  # Python 3.9+
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -52,6 +51,10 @@ class FluviusApiError(RuntimeError):
     """Raised when the Fluvius API call fails."""
 
 
+class FluviusAuthenticationError(FluviusApiError):
+    """Credentials must be updated through Home Assistant reauthentication."""
+
+
 @dataclass(slots=True)
 class FluviusDailySummary:
     """Container for a single day of energy data."""
@@ -59,7 +62,7 @@ class FluviusDailySummary:
     day_id: str
     start: datetime
     end: datetime
-    metrics: Dict[str, float]
+    metrics: dict[str, float]
 
 
 @dataclass(slots=True)
@@ -74,13 +77,14 @@ class FluviusPeakMeasurement:
 
 
 @dataclass(slots=True)
-class FluviusIntervalMeasurement:
-    """Container for one sub-daily interval: 15 minutes for electricity, 60 for gas."""
+class FluviusQuarterHourlyMeasurement:
+    """Container for a single 15-minute interval of energy data."""
 
     start: datetime
     end: datetime
     consumption: float  # kWh consumed in this interval
     injection: float  # kWh injected in this interval
+    metrics: dict[str, float] = field(default_factory=dict)
 
 
 class FluviusApiClient:
@@ -96,7 +100,7 @@ class FluviusApiClient:
         meter_serial: str,
         meter_type: str = DEFAULT_METER_TYPE,
         remember_me: bool = False,
-        options: Optional[Dict[str, Any]] = None,
+        options: dict[str, Any] | None = None,
     ) -> None:
         self._session = session
         self._email = email
@@ -106,14 +110,17 @@ class FluviusApiClient:
         self._meter_type = meter_type
         self._remember_me = remember_me
         self._options = options or {}
+        self._access_token: str | None = None
+        self._token_expires = 0.0
         self._verbose = bool(self._options.get(CONF_VERBOSE_LOGGING, DEFAULT_VERBOSE_LOGGING))
-        # Resolved on first successful fetch and sticky for the lifetime of the
-        # client, so the probe costs at most a few extra requests once.
-        self._interval_granularity: Optional[str] = None
-        # What each probed granularity code answered, for a single diagnostic line.
-        self._probe_outcomes: Dict[str, str] = {}
-        # Set when a full probe found nothing, to stop re-asking every hour. Cleared
-        # by reloading the entry, so a future Fluvius change is still picked up.
+        # Resolved on the first successful interval fetch and sticky for the lifetime
+        # of the client, so the probe costs a few extra requests only once.
+        self._interval_granularity: str | None = None
+        self._resolved_interval_minutes: int | None = None
+        # What each probed code answered, for a single diagnostic line.
+        self._probe_outcomes: dict[str, str] = {}
+        # Set when a full probe found nothing, to stop re-asking every hour. Reloading
+        # the entry rebuilds the client, so a future Fluvius change is still picked up.
         self._interval_unavailable = False
 
     def _log_verbose(self, message: str, *args: Any) -> None:
@@ -128,13 +135,13 @@ class FluviusApiClient:
         return self._expected_interval_minutes()
 
     @property
-    def resolved_granularity(self) -> Optional[str]:
+    def resolved_granularity(self) -> str | None:
         """Granularity code the probe settled on, None while still unresolved."""
 
         return self._interval_granularity
 
     @property
-    def probe_outcomes(self) -> Dict[str, str]:
+    def probe_outcomes(self) -> dict[str, str]:
         """What each probed granularity code answered, for diagnostics."""
 
         return dict(self._probe_outcomes)
@@ -148,143 +155,94 @@ class FluviusApiClient:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    async def fetch_daily_summaries(self) -> List[FluviusDailySummary]:
+    async def fetch_daily_summaries(self) -> list[FluviusDailySummary]:
         """Retrieve the most recent consumption data and return parsed summaries."""
 
         summaries, _ = await self._fetch_summaries_and_spikes(include_spikes=False)
         return summaries
 
-    async def fetch_daily_summaries_with_spikes(self) -> tuple[
-        List[FluviusDailySummary],
-        List[FluviusPeakMeasurement],
+    async def fetch_daily_summaries_with_spikes(
+        self,
+    ) -> tuple[
+        list[FluviusDailySummary],
+        list[FluviusPeakMeasurement],
     ]:
         """Return both the daily summaries and the monthly peak power values."""
 
         return await self._fetch_summaries_and_spikes(include_spikes=True)
 
-    async def fetch_interval_consumption(
+    async def fetch_quarter_hourly_consumption(
         self,
-        days_back: Optional[int] = None,
-        skip_hours: Optional[Set[datetime]] = None,
-    ) -> List[FluviusIntervalMeasurement]:
-        """Retrieve sub-daily consumption data at the meter's native resolution.
+        days_back: int | None = None,
+    ) -> list[FluviusQuarterHourlyMeasurement]:
+        """Fetch every day in the lookback, including delayed publications.
 
-        Electricity is registered per quarter-hour, gas per hour. Fluvius only
-        publishes this data for days that are already closed, so the window always
-        ends yesterday, and it refuses multi-day ranges at these granularities,
-        hence one request per day.
-
-        Args:
-            days_back: How many past days to cover. Defaults to the configured
-                option, widened to a floor for gas because Fluvius releases gas
-                measurements with roughly a 72-hour delay.
-            skip_hours: UTC hours already held elsewhere. A day whose hours are all
-                present is not requested at all, which in steady state cuts the whole
-                window down to the single day that is actually new.
-
-        Returns:
-            List of interval measurements sorted by start time.
+        Electricity is registered per quarter-hour, gas per hour, but Fluvius does not
+        document which granularity code serves which, so the code is probed once and
+        then reused. The legacy method name is retained for callers. Each request
+        covers one local day, aligned on the meter's own day.
         """
         if self._interval_unavailable:
             LOGGER.debug(
-                "Skipping interval fetch for meter %s: a full probe already established "
-                "that Fluvius serves no sub-daily data here. Reload the entry to retry.",
+                "Skipping the interval fetch for meter %s: a full probe already "
+                "established that Fluvius serves no sub-daily data here. "
+                "Reload the entry to retry.",
                 self._meter_serial,
             )
             return []
 
-        window = self._resolve_interval_days_back(days_back)
-        wanted = [
-            day_offset
-            for day_offset in range(window, 0, -1)
-            if not self._day_already_held(day_offset, skip_hours)
-        ]
-        skipped_days = window - len(wanted)
+        count = self.days_back if days_back is None else max(1, int(days_back))
+        token = await self._async_get_access_token()
+        measurements = {}
+        # Oldest first, so the probe hits the day most likely to hold data.
+        for offset in range(count, 0, -1):
+            for measurement in await self._async_fetch_interval_day(token, offset):
+                if measurement.end <= self.history_end:
+                    measurements[measurement.start] = measurement
 
-        if not wanted:
-            LOGGER.debug(
-                "Interval data: all %d day(s) of the window are already imported, "
-                "nothing to fetch",
-                window,
-            )
-            return []
+        if not measurements:
+            self._report_empty_interval_window(count)
+        return sorted(measurements.values(), key=lambda item: item.start)
 
-        # Only authenticate once we know there is something to ask for.
-        access_token = await self._async_get_access_token()
+    def _report_empty_interval_window(self, count: int) -> None:
+        """Explain an empty window, and stop probing when no code ever worked."""
 
-        measurements: List[FluviusIntervalMeasurement] = []
-        seen_starts: set[datetime] = set()
-        # Oldest first, so the result is already ordered and the granularity probe
-        # hits the day most likely to hold data.
-        for day_offset in wanted:
-            day_measurements = await self._async_fetch_interval_day(access_token, day_offset)
-            for item in day_measurements:
-                if item.start in seen_starts:
-                    continue
-                seen_starts.add(item.start)
-                measurements.append(item)
-
-        measurements.sort(key=lambda item: item.start)
-        if measurements:
-            LOGGER.debug(
-                "Interval data: %d of %d day(s) fetched with granularity=%s "
-                "(%d already imported) -> %d measurements",
-                len(wanted),
-                window,
-                self._interval_granularity,
-                skipped_days,
-                len(measurements),
-            )
-        elif skipped_days:
-            # Part of the window was skipped, so an empty result says nothing about
-            # whether this meter has sub-daily data. Do not treat it as a verdict.
-            LOGGER.debug(
-                "Interval data: the %d day(s) not yet imported returned nothing; "
-                "Fluvius has probably not published them yet",
-                len(wanted),
-            )
-        elif self._interval_granularity is None:
-            # Every candidate was tried on every day of the window and none returned
-            # anything: this meter has no sub-daily data. Stop asking — the probe
-            # costs one request per candidate per day, every refresh.
-            self._interval_unavailable = True
-            LOGGER.warning(
-                "No %d-minute data for this %s meter after probing %d day(s) back to %s. "
-                "Outcome per granularity code: %s. Fluvius is not serving sub-daily data "
-                "for meter %s, so the interval fetch is now disabled for this entry; "
-                "daily sensors are unaffected. Reload the entry to probe again.",
-                self._expected_interval_minutes(),
-                self._meter_type,
-                window,
-                self._build_interval_range(window).get("historyFrom", "")[:10],
-                self._format_probe_report(),
-                self._meter_serial,
-            )
-        else:
+        if self._interval_granularity is not None:
             # The code is known to work, so this is a transient gap (publication
             # delay, outage). Keep trying on the next refresh.
-            LOGGER.warning(
-                "No interval data this refresh for meter %s, although granularity=%s is "
-                "known to work. Fluvius may not have published the requested days yet.",
+            LOGGER.debug(
+                "No interval data this refresh for meter %s, although granularity=%s "
+                "is known to work. Fluvius may not have published the requested "
+                "days yet.",
                 self._meter_serial,
                 self._interval_granularity,
             )
-        return measurements
-
-    def _day_already_held(
-        self,
-        day_offset: int,
-        skip_hours: Optional[Set[datetime]],
-    ) -> bool:
-        """Whether every hour of this day is already accounted for elsewhere.
-
-        A partially covered day is re-fetched: Fluvius publishes days in one go, so a
-        gap means the day was incomplete when it was first read.
-        """
-
-        if not skip_hours:
-            return False
-        return all(hour in skip_hours for hour in self._interval_day_hours(day_offset))
+            return
+        failed = [code for code, outcome in self._probe_outcomes.items() if "failed" in outcome]
+        if failed or not self._probe_outcomes:
+            # Requests were rejected rather than answered, so this says nothing about
+            # what the meter holds. Stay enabled and retry on the next refresh.
+            LOGGER.warning(
+                "The interval probe could not reach Fluvius for meter %s (granularity "
+                "code(s) %s failed). Outcome per code: %s. Retrying on the next refresh.",
+                self._meter_serial,
+                ", ".join(sorted(failed)) or "none",
+                self._format_probe_report(),
+            )
+            return
+        # Every candidate was tried on every day of the window and each answered with
+        # an empty payload: this meter has no sub-daily data. Stop asking, because the
+        # probe costs one request per candidate per day, every refresh.
+        self._interval_unavailable = True
+        LOGGER.warning(
+            "No %d-minute data for this %s meter after probing %d day(s). Outcome per "
+            "granularity code: %s. The interval fetch is now disabled for this entry; "
+            "the daily sensors are unaffected. Reload the entry to probe again.",
+            self._expected_interval_minutes(),
+            self._meter_type,
+            count,
+            self._format_probe_report(),
+        )
 
     def _format_probe_report(self) -> str:
         """Render the per-candidate probe outcomes for a single log line."""
@@ -297,32 +255,20 @@ class FluviusApiClient:
         )
 
     async def _async_fetch_interval_day(
-        self,
-        access_token: str,
-        day_offset: int,
-    ) -> List[FluviusIntervalMeasurement]:
+        self, access_token: str, days_back: int
+    ) -> list[FluviusQuarterHourlyMeasurement]:
         """Fetch one day, resolving the granularity code on first use."""
 
-        if self._interval_granularity is not None:
-            payload = await self._fetch_raw_interval(
-                access_token, day_offset, self._interval_granularity
-            )
-            measurements = self._interval_from_payload(payload)
-            LOGGER.debug(
-                "Interval data: day -%d gave %d raw intervals -> %d parsed measurements",
-                day_offset,
-                len(payload),
-                len(measurements),
-            )
-            return measurements
-
-        return await self._async_probe_granularity(access_token, day_offset)
+        if self._interval_granularity is None:
+            return await self._async_probe_granularity(access_token, days_back)
+        payload = await self._fetch_raw_quarter_hourly(
+            access_token, days_back, self._interval_granularity
+        )
+        return self._quarter_hourly_from_payload(payload)
 
     async def _async_probe_granularity(
-        self,
-        access_token: str,
-        day_offset: int,
-    ) -> List[FluviusIntervalMeasurement]:
+        self, access_token: str, days_back: int
+    ) -> list[FluviusQuarterHourlyMeasurement]:
         """Try each candidate code until one returns the expected interval length.
 
         Nothing is remembered until real data comes back: an empty payload only means
@@ -330,22 +276,23 @@ class FluviusApiClient:
         """
 
         expected = self._expected_interval_minutes()
-        best_effort: Optional[tuple[str, List[FluviusIntervalMeasurement], int]] = None
+        best_effort: tuple[str, list[FluviusQuarterHourlyMeasurement], int] | None = None
 
         for candidate in self._granularity_candidates():
             try:
-                payload = await self._fetch_raw_interval(access_token, day_offset, candidate)
+                payload = await self._fetch_raw_quarter_hourly(access_token, days_back, candidate)
+            except FluviusAuthenticationError:
+                raise
             except FluviusApiError as err:
                 LOGGER.debug("Interval probe: granularity=%s rejected (%s)", candidate, err)
                 self._probe_outcomes[candidate] = f"request failed ({err})"
                 continue
 
-            measurements = self._interval_from_payload(payload)
+            measurements = self._intervals_from_payload(payload)
             detected = self._detect_interval_minutes(measurements)
             self._probe_outcomes[candidate] = (
                 "no data" if detected is None else f"{detected}-minute intervals"
             )
-
             if detected == expected:
                 LOGGER.debug(
                     "Interval probe: confirmed %d-minute intervals with granularity=%s for %s",
@@ -353,23 +300,9 @@ class FluviusApiClient:
                     candidate,
                     self._meter_type,
                 )
-                self._interval_granularity = candidate
-                return measurements
-
+                return self._settle_on_granularity(candidate, detected, measurements)
             if detected is None:
-                LOGGER.debug(
-                    "Interval probe: granularity=%s returned no data for day -%d",
-                    candidate,
-                    day_offset,
-                )
                 continue
-
-            LOGGER.debug(
-                "Interval probe: granularity=%s returned %d-minute intervals (expected %d)",
-                candidate,
-                detected,
-                expected,
-            )
             if best_effort is None:
                 best_effort = (candidate, measurements, detected)
 
@@ -377,59 +310,58 @@ class FluviusApiClient:
             candidate, measurements, detected = best_effort
             LOGGER.warning(
                 "No granularity code returned %d-minute intervals for this %s meter. "
-                "Falling back to granularity=%s, which serves %d-minute intervals. "
-                "The data is still imported at that resolution.",
+                "Falling back to granularity=%s, which serves %d-minute intervals; "
+                "the data is still imported at that resolution.",
                 expected,
                 self._meter_type,
                 candidate,
                 detected,
             )
-            self._interval_granularity = candidate
-            return measurements
+            return self._settle_on_granularity(candidate, detected, measurements)
 
         LOGGER.debug(
             "Interval probe: no candidate returned data for day -%d; will retry next refresh",
-            day_offset,
+            days_back,
         )
         return []
 
+    def _settle_on_granularity(
+        self,
+        candidate: str,
+        detected: int,
+        measurements: list[FluviusQuarterHourlyMeasurement],
+    ) -> list[FluviusQuarterHourlyMeasurement]:
+        """Remember the probed code and length, then keep only matching intervals."""
+
+        self._interval_granularity = candidate
+        self._resolved_interval_minutes = detected
+        return self._keep_resolved_intervals(measurements)
+
     def _granularity_candidates(self) -> tuple[str, ...]:
-        return INTERVAL_GRANULARITY_CANDIDATES.get(
+        """Codes to probe, the configured one first so the option still counts."""
+
+        candidates = INTERVAL_GRANULARITY_CANDIDATES.get(
             self._meter_type, INTERVAL_GRANULARITY_CANDIDATES[METER_TYPE_ELECTRICITY]
         )
+        configured = str(self._options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY))
+        if configured in (DEFAULT_GRANULARITY, ""):
+            return candidates
+        return (configured, *(code for code in candidates if code != configured))
 
     def _expected_interval_minutes(self) -> int:
         return INTERVAL_MINUTES_BY_METER_TYPE.get(
             self._meter_type, INTERVAL_MINUTES_BY_METER_TYPE[METER_TYPE_ELECTRICITY]
         )
 
-    def _resolve_interval_days_back(self, days_back: Optional[int]) -> int:
-        """Derive the interval window from the single configured history depth.
-
-        Same option as the daily summaries, but capped: the summaries fetch their
-        whole range in one request while this endpoint needs one request per day.
-        """
-
-        raw: Any = days_back
-        if raw is None:
-            raw = self._options.get(CONF_DAYS_BACK, DEFAULT_DAYS_BACK)
-        try:
-            value = int(float(raw))
-        except (TypeError, ValueError):
-            value = DEFAULT_DAYS_BACK
-        if self._meter_type == METER_TYPE_GAS:
-            value = max(value, GAS_MIN_INTERVAL_LOOKBACK_DAYS)
-        return min(max(value, 1), MAX_INTERVAL_DAYS_BACK)
-
     @staticmethod
     def _detect_interval_minutes(
-        measurements: List[FluviusIntervalMeasurement],
-    ) -> Optional[int]:
+        measurements: list[FluviusQuarterHourlyMeasurement],
+    ) -> int | None:
         """Return the most frequent interval length, in minutes."""
 
-        counts: Dict[int, int] = {}
+        counts: dict[int, int] = {}
         for item in measurements:
-            minutes = int(round((item.end - item.start).total_seconds() / 60))
+            minutes = round((item.end - item.start).total_seconds() / 60)
             if minutes <= 0:
                 continue
             counts[minutes] = counts.get(minutes, 0) + 1
@@ -441,30 +373,38 @@ class FluviusApiClient:
         self,
         *,
         include_spikes: bool,
-    ) -> tuple[List[FluviusDailySummary], List[FluviusPeakMeasurement]]:
+    ) -> tuple[list[FluviusDailySummary], list[FluviusPeakMeasurement]]:
         access_token = await self._async_get_access_token()
         payload = await self._fetch_raw_consumption(access_token)
         LOGGER.debug("Raw consumption payload has %d items", len(payload))
         if payload:
-            LOGGER.debug("First payload item keys: %s", list(payload[0].keys()) if payload[0] else "empty")
+            LOGGER.debug(
+                "First payload item keys: %s", list(payload[0].keys()) if payload[0] else "empty"
+            )
         summaries = self._summaries_from_payload(payload)
         LOGGER.debug("Parsed %d summaries from payload", len(summaries))
         # Don't fail if no summaries - data may not be available yet for new setups
         # The coordinator will handle empty data gracefully
 
-        peaks: List[FluviusPeakMeasurement] = []
+        peaks: list[FluviusPeakMeasurement] = []
         if include_spikes and self._meter_type != METER_TYPE_GAS:
-            spike_payload = await self._fetch_raw_spikes(access_token)
-            peaks = self._spikes_from_payload(spike_payload)
+            try:
+                spike_payload = await self._fetch_raw_spikes(access_token)
+                peaks = self._spikes_from_payload(spike_payload)
+            except FluviusAuthenticationError:
+                raise
+            except FluviusApiError:
+                LOGGER.debug("Peak power data is temporarily unavailable")
         return summaries, peaks
 
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
     async def _async_get_access_token(self) -> str:
-        self._log_verbose("Starting authentication for user: %s", self._email[:3] + "***")
+        if self._access_token and time.monotonic() < self._token_expires:
+            return self._access_token
         try:
-            access_token, _ = await async_get_bearer_token(
+            access_token, tokens = await async_get_bearer_token(
                 self._session,
                 self._email,
                 self._password,
@@ -472,354 +412,128 @@ class FluviusApiClient:
                 verbose=self._verbose,
             )
         except FluviusAuthError as err:
-            error_msg = str(err)
-            LOGGER.error(
-                "FLUVIUS AUTH ERROR: Failed to authenticate with Fluvius. "
-                "This usually means: 1) Invalid email/password, 2) Fluvius service is down, "
-                "or 3) Your account needs re-verification at mijn.fluvius.be. "
-                "Details: %s",
-                error_msg,
-            )
-            raise FluviusApiError(
-                f"Authentication failed - check your credentials or visit mijn.fluvius.be to verify your account. Error: {err}"
-            ) from err
-        except aiohttp.ClientError as err:
-            LOGGER.error(
-                "FLUVIUS NETWORK ERROR: Could not reach Fluvius authentication servers. "
-                "Check your internet connection. Details: %s",
-                err,
-            )
-            raise FluviusApiError(
-                f"Network error while authenticating - check internet connection. Error: {err}"
-            ) from err
-
+            raise FluviusAuthenticationError("Fluvius authentication failed") from err
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise FluviusApiError("Cannot reach Fluvius authentication") from err
         if not access_token:
-            LOGGER.error(
-                "FLUVIUS AUTH ERROR: Authentication completed but no access token was returned. "
-                "This is unexpected - try re-authenticating or check Fluvius service status."
-            )
-            raise FluviusApiError(
-                "Authentication succeeded but no access token was returned - try removing and re-adding the integration"
-            )
-        
-        self._log_verbose("Authentication successful, received access token")
+            raise FluviusAuthenticationError("Fluvius returned no access token")
+        self._access_token = access_token
+        self._token_expires = time.monotonic() + max(0, int(tokens.get("expires_in", 3600)) - 60)
         return access_token
 
-    async def _fetch_raw_consumption(self, access_token: str) -> List[Dict[str, Any]]:
-        history_params = self._build_history_range()
-        granularity = self._resolve_summary_granularity()
-        params = {
-            **history_params,
-            "granularity": granularity,
-            "asServiceProvider": "false",
-            "meterSerialNumber": self._meter_serial,
-        }
-        
+    async def _fetch_raw_consumption(self, access_token: str) -> list[dict[str, Any]]:
+        # Daily summaries must stay daily even when detailed history is enabled.
+        return await self._request_history(
+            access_token,
+            {
+                **self._build_history_range(),
+                "granularity": DEFAULT_GRANULARITY,
+            },
+        )
+
+    async def _request_history(
+        self, access_token: str, params: dict, *, spikes: bool = False
+    ) -> list[dict]:
+        endpoint = "meter-measurement-spikes" if spikes else "meter-measurement-history"
+        access_token = self._access_token or access_token
+        params = {**params, "asServiceProvider": "false", "meterSerialNumber": self._meter_serial}
         self._log_verbose(
-            "API Request - URL: meter-measurement-history/%s, Params: granularity=%s, from=%s, until=%s, meter=%s",
-            self._ean,
-            granularity,
-            history_params.get("historyFrom", ""),
-            history_params.get("historyUntil", ""),
-            self._meter_serial,
+            "Request %s: granularity=%s, from=%s, until=%s",
+            endpoint,
+            params.get("granularity"),
+            params["historyFrom"],
+            params["historyUntil"],
         )
-        
-        LOGGER.debug(
-            "Fetching consumption: granularity=%s, from=%s, until=%s",
-            granularity,
-            history_params.get("historyFrom", "")[:10],
-            history_params.get("historyUntil", "")[:10],
-        )
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (HomeAssistant-FluviusEnergy)",
-        }
-        url = f"https://mijn.fluvius.be/verbruik/api/meter-measurement-history/{self._ean}"
+        for attempt in range(2):
+            try:
+                async with self._session.get(
+                    f"https://mijn.fluvius.be/verbruik/api/{endpoint}/{self._ean}",
+                    params=params,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Accept": "application/json",
+                    },
+                    timeout=30,
+                ) as response:
+                    if response.status == 401:
+                        self._access_token = None
+                        if attempt:
+                            raise FluviusAuthenticationError("Fluvius rejected the access token")
+                    else:
+                        response.raise_for_status()
+                        data = await response.json()
+                        if not isinstance(data, list):
+                            raise FluviusApiError(
+                                "Fluvius returned an unexpected payload (expected list)"
+                            )
+                        return data
+            except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+                raise FluviusApiError(
+                    f"Fluvius {endpoint} request failed ({type(err).__name__})"
+                ) from err
+            access_token = await self._async_get_access_token()
+        raise FluviusAuthenticationError("Fluvius rejected the access token")
 
-        try:
-            async with self._session.get(url, params=params, headers=headers, timeout=30) as response:
-                self._log_verbose(
-                    "API Response - Status: %s, Content-Type: %s",
-                    response.status,
-                    getattr(response, 'content_type', 'unknown'),
-                )
-                if response.status != 200:
-                    response_text = await response.text()
-                    self._log_verbose("API Error Response Body: %s", response_text[:500])
-                    LOGGER.error(
-                        "FLUVIUS API ERROR: Consumption API returned HTTP %s. "
-                        "EAN: %s, Meter: %s. Response: %s",
-                        response.status,
-                        self._ean,
-                        self._meter_serial,
-                        response_text[:200],
-                    )
-                response.raise_for_status()
-                data: Any = await response.json()
-        except aiohttp.ClientResponseError as err:
-            LOGGER.error(
-                "FLUVIUS API ERROR: Failed to fetch consumption data. HTTP Status: %s, Reason: %s. "
-                "This could mean: 1) EAN '%s' is invalid, 2) Meter serial '%s' doesn't match, "
-                "or 3) Fluvius API is experiencing issues.",
-                err.status,
-                err.message,
-                self._ean,
-                self._meter_serial,
-            )
-            raise FluviusApiError(
-                f"Consumption API call failed (HTTP {err.status}): {err.message}. Check EAN and meter serial."
-            ) from err
-        except aiohttp.ClientError as err:
-            LOGGER.error(
-                "FLUVIUS NETWORK ERROR: Could not fetch consumption data. "
-                "Check internet connection. Error: %s",
-                err,
-            )
-            raise FluviusApiError(f"Consumption API call failed - network error: {err}") from err
-        except ValueError as err:  # pragma: no cover - defensive
-            LOGGER.error("FLUVIUS API ERROR: Received invalid JSON from Fluvius: %s", err)
-            raise FluviusApiError(f"Failed to decode Fluvius JSON response: {err}") from err
+    @property
+    def days_back(self) -> int:
+        days = max(1, int(self._options.get(CONF_DAYS_BACK, DEFAULT_DAYS_BACK)))
+        return max(days, GAS_MIN_LOOKBACK_DAYS) if self._meter_type == METER_TYPE_GAS else days
 
-        if not isinstance(data, list):
-            LOGGER.error(
-                "FLUVIUS API ERROR: Unexpected response format. Expected list, got %s. "
-                "Response preview: %s",
-                type(data).__name__,
-                str(data)[:200],
-            )
-            raise FluviusApiError(
-                f"Fluvius API returned unexpected response type: {type(data).__name__} (expected list)"
-            )
-        
-        self._log_verbose("API Response - Received %d items in payload", len(data))
-        if data and self._verbose:
-            self._log_verbose("First item keys: %s", list(data[0].keys()) if data[0] else "empty")
-        
-        return data
+    @property
+    def history_end(self) -> datetime:
+        tz = self._resolve_timezone(self._options.get(CONF_TIMEZONE, DEFAULT_TIMEZONE))
+        value = self._options.get(CONF_HISTORY_UNTIL)
+        if value:
+            end = datetime.fromisoformat(value)
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=tz)
+            return min(end.astimezone(tz), datetime.now(tz))
+        return datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    def _resolve_summary_granularity(self) -> str:
-        """Return the granularity used for the daily summaries.
+    @property
+    def detailed_history(self) -> bool:
+        return str(self._options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY)) != DEFAULT_GRANULARITY
 
-        Only the daily code returns data for the multi-day ranges the summaries are
-        built from; a sub-daily code answers HTTP 200 with an empty list, which used
-        to silently leave every daily and lifetime sensor at zero.
-        """
-
-        configured = str(self._options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY))
-        if configured != SUMMARY_GRANULARITY:
-            LOGGER.warning(
-                "Ignoring configured granularity=%s for the daily summaries: that code "
-                "returns an empty payload for multi-day ranges. Using granularity=%s. "
-                "The detailed interval data is fetched separately and is unaffected.",
-                configured,
-                SUMMARY_GRANULARITY,
-            )
-        return SUMMARY_GRANULARITY
-
-    def _build_history_range(self) -> Dict[str, str]:
-        tzinfo = self._resolve_timezone(self._options.get(CONF_TIMEZONE, DEFAULT_TIMEZONE))
-        days_back = max(int(self._options.get(CONF_DAYS_BACK, DEFAULT_DAYS_BACK)), 1)
-
-        if self._meter_type == METER_TYPE_GAS:
-            days_back = max(days_back, GAS_MIN_LOOKBACK_DAYS)
-
-        local_now = datetime.now(tzinfo)
-        # Daily granularity accepts multi-day ranges ending today.
-        start_date = (local_now - timedelta(days=days_back)).replace(
+    def _build_history_range(self) -> dict[str, str]:
+        end = self.history_end
+        start = (end - timedelta(days=self.days_back)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        end_date = local_now.replace(hour=23, minute=59, second=59, microsecond=999000)
-
-        return {
-            "historyFrom": start_date.isoformat(timespec="milliseconds"),
-            "historyUntil": end_date.isoformat(timespec="milliseconds"),
-        }
-
-    async def _fetch_raw_interval(
-        self,
-        access_token: str,
-        day_offset: int,
-        granularity: str,
-    ) -> List[Dict[str, Any]]:
-        """Fetch one day of raw sub-daily consumption data from the API."""
-        history_params = self._build_interval_range(day_offset)
-        params = {
-            **history_params,
-            "granularity": granularity,
-            "asServiceProvider": "false",
-            "meterSerialNumber": self._meter_serial,
-            **INTERVAL_EXTRA_PARAMS,
-        }
-
-        self._log_verbose(
-            "Interval API Request - from=%s, until=%s, day_offset=%d",
-            history_params.get("historyFrom", ""),
-            history_params.get("historyUntil", ""),
-            day_offset,
-        )
-
-        LOGGER.debug(
-            "Fetching interval data: granularity=%s, from=%s, until=%s, meter=%s",
-            granularity,
-            history_params.get("historyFrom", ""),
-            history_params.get("historyUntil", ""),
-            self._meter_serial,
-        )
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (HomeAssistant-FluviusEnergy)",
-        }
-        url = f"https://mijn.fluvius.be/verbruik/api/meter-measurement-history/{self._ean}"
-
-        try:
-            async with self._session.get(url, params=params, headers=headers, timeout=30) as response:
-                self._log_verbose("Interval API Response - Status: %s", response.status)
-                if response.status != 200:
-                    response_text = await response.text()
-                    LOGGER.warning(
-                        "FLUVIUS API WARNING: Interval API returned HTTP %s. "
-                        "This data may not be available for your meter. Response: %s",
-                        response.status,
-                        response_text[:200],
-                    )
-                response.raise_for_status()
-                data: Any = await response.json()
-        except aiohttp.ClientResponseError as err:
-            LOGGER.warning(
-                "FLUVIUS API WARNING: Could not fetch interval data (HTTP %s). "
-                "15-minute interval data may not be available for meter %s.",
-                err.status,
-                self._meter_serial,
-            )
-            raise FluviusApiError(
-                f"Interval consumption API failed (HTTP {err.status}) - this data may not be available for your meter"
-            ) from err
-        except aiohttp.ClientError as err:
-            LOGGER.warning("FLUVIUS NETWORK WARNING: Could not fetch interval data: %s", err)
-            raise FluviusApiError(f"Interval consumption API call failed: {err}") from err
-        except ValueError as err:  # pragma: no cover - defensive
-            raise FluviusApiError(f"Failed to decode Fluvius JSON: {err}") from err
-
-        if not isinstance(data, list):
-            raise FluviusApiError("Fluvius API returned an unexpected payload (expected list)")
-        
-        self._log_verbose("Interval API Response - Received %d intervals", len(data))
-        if data:
-            self._log_verbose("Interval raw first interval: %s", data[0])
-            self._log_verbose("Interval raw last interval: %s", data[-1])
-        return data
-
-    def _interval_day_bounds(self, day_offset: int) -> tuple[datetime, datetime]:
-        """Return the local start and end of a single past day.
-
-        Interval data requires SINGLE DAY requests and is only published for days
-        that are already closed, so `day_offset` is counted back from today: 1 means
-        yesterday, 2 the day before, and so on. Today is never available.
-
-        The window must line up with the meter's own day, or Fluvius answers HTTP 200
-        with an empty list rather than a partial result. Electricity uses calendar
-        days (00:00 -> 00:00); gas uses the gas day, 06:00 -> 06:00 the next morning.
-        """
-        tzinfo = self._resolve_timezone(self._options.get(CONF_TIMEZONE, DEFAULT_TIMEZONE))
-        local_now = datetime.now(tzinfo)
-        start_hour = GAS_DAY_START_HOUR if self._meter_type == METER_TYPE_GAS else 0
-
-        start = (local_now - timedelta(days=max(day_offset, 1))).replace(
-            hour=start_hour, minute=0, second=0, microsecond=0
-        )
-        # Wall-clock +1 day, so the span stays a real day across DST changes.
-        return start, start + timedelta(days=1)
-
-    def _build_interval_range(self, day_offset: int) -> Dict[str, str]:
-        start, end = self._interval_day_bounds(day_offset)
-        # One millisecond short of the next day, so the window never bleeds into it.
         return {
             "historyFrom": start.isoformat(timespec="milliseconds"),
-            "historyUntil": (end - timedelta(milliseconds=1)).isoformat(
-                timespec="milliseconds"
-            ),
+            "historyUntil": (end - timedelta(milliseconds=1)).isoformat(timespec="milliseconds"),
         }
 
-    def _interval_day_hours(self, day_offset: int) -> List[datetime]:
-        """UTC hours this day spans, matching how statistics are bucketed.
-
-        Walks in UTC rather than local time so a DST day yields its real 23 or 25
-        hours instead of a fixed 24.
-        """
-        start, end = self._interval_day_bounds(day_offset)
-        cursor = start.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
-        end_utc = end.astimezone(timezone.utc)
-
-        hours: List[datetime] = []
-        while cursor < end_utc:
-            hours.append(cursor)
-            cursor += timedelta(hours=1)
-        return hours
-
-    def interval_window_start(self, days_back: Optional[int] = None) -> datetime:
-        """UTC start of the oldest day the interval fetch would cover."""
-
-        window = self._resolve_interval_days_back(days_back)
-        start, _ = self._interval_day_bounds(window)
-        return start.astimezone(timezone.utc)
-
-    async def _fetch_raw_spikes(self, access_token: str) -> List[Dict[str, Any]]:
-        spike_params = self._build_spike_history_range()
-        params = {
-            **spike_params,
-            "asServiceProvider": "false",
-            "meterSerialNumber": self._meter_serial,
-        }
-        
-        self._log_verbose(
-            "Peak power API Request - from=%s, until=%s",
-            spike_params.get("historyFrom", "")[:10],
-            spike_params.get("historyUntil", "")[:10],
+    async def _fetch_raw_quarter_hourly(
+        self, access_token: str, days_back: int, granularity: str
+    ) -> list[dict[str, Any]]:
+        return await self._request_history(
+            access_token,
+            {
+                **self._build_quarter_hourly_range(days_back),
+                "granularity": granularity,
+            },
         )
-        
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (HomeAssistant-FluviusEnergy)",
+
+    def _build_quarter_hourly_range(self, days_back: int) -> dict[str, str]:
+        end = self.history_end
+        # A cutoff inside a day includes that day's completed intervals.
+        anchor = (end - timedelta(microseconds=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        start = anchor - timedelta(days=max(days_back, 1) - 1)
+        until = min(start + timedelta(days=1), end) - timedelta(milliseconds=1)
+        return {
+            "historyFrom": start.isoformat(timespec="milliseconds"),
+            "historyUntil": until.isoformat(timespec="milliseconds"),
         }
-        url = f"https://mijn.fluvius.be/verbruik/api/meter-measurement-spikes/{self._ean}"
 
-        try:
-            async with self._session.get(url, params=params, headers=headers, timeout=30) as response:
-                self._log_verbose("Peak power API Response - Status: %s", response.status)
-                if response.status != 200:
-                    response_text = await response.text()
-                    LOGGER.warning(
-                        "FLUVIUS API WARNING: Peak power API returned HTTP %s. Response: %s",
-                        response.status,
-                        response_text[:200],
-                    )
-                response.raise_for_status()
-                data: Any = await response.json()
-        except aiohttp.ClientResponseError as err:
-            LOGGER.warning(
-                "FLUVIUS API WARNING: Could not fetch peak power data (HTTP %s). "
-                "Peak power data may not be available for meter %s.",
-                err.status,
-                self._meter_serial,
-            )
-            raise FluviusApiError(f"Peak power API call failed (HTTP {err.status})") from err
-        except aiohttp.ClientError as err:
-            LOGGER.warning("FLUVIUS NETWORK WARNING: Could not fetch peak power data: %s", err)
-            raise FluviusApiError(f"Peak power API call failed: {err}") from err
-        except ValueError as err:  # pragma: no cover - defensive
-            raise FluviusApiError(f"Failed to decode Fluvius JSON: {err}") from err
+    async def _fetch_raw_spikes(self, access_token: str) -> list[dict[str, Any]]:
+        return await self._request_history(
+            access_token, self._build_spike_history_range(), spikes=True
+        )
 
-        if not isinstance(data, list):
-            raise FluviusApiError("Fluvius spike API returned an unexpected payload (expected list)")
-        
-        self._log_verbose("Peak power API Response - Received %d items", len(data))
-        return data
-
-    def _build_spike_history_range(self) -> Dict[str, str]:
+    def _build_spike_history_range(self) -> dict[str, str]:
         tzinfo = self._resolve_timezone(self._options.get(CONF_TIMEZONE, DEFAULT_TIMEZONE))
         local_now = datetime.now(tzinfo)
         start_date = local_now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -829,7 +543,7 @@ class FluviusApiClient:
             "historyUntil": end_date.isoformat(timespec="milliseconds"),
         }
 
-    def _resolve_timezone(self, tz_name: Optional[str]):
+    def _resolve_timezone(self, tz_name: str | None):
         if tz_name and ZoneInfo is not None:
             try:
                 return ZoneInfo(tz_name)
@@ -841,7 +555,7 @@ class FluviusApiClient:
         local = datetime.now().astimezone().tzinfo
         if local:
             return local
-        return timezone.utc
+        return UTC
 
     # ------------------------------------------------------------------
     # Payload parsing helpers
@@ -856,19 +570,16 @@ class FluviusApiClient:
             return CUBIC_METER_UNIT_CODE
         return KILO_WATT_HOUR_UNIT_CODE
 
-    def _summaries_from_payload(self, payload: List[Dict[str, Any]]) -> List[FluviusDailySummary]:
-        summaries: List[FluviusDailySummary] = []
-        for i, day_data in enumerate(payload):
-            summary = self._summarize_day(day_data)
-            if summary:
-                summaries.append(summary)
-            else:
-                LOGGER.debug("Could not parse day_data at index %d: d=%s", i, day_data.get("d"))
-        summaries.sort(key=lambda item: item.start)
-        return summaries
+    def _summaries_from_payload(self, payload: list[dict[str, Any]]) -> list[FluviusDailySummary]:
+        summaries = {}
+        for item in payload:
+            summary = self._summarize_day(item)
+            if summary and summary.end <= self.history_end:
+                summaries[summary.start] = summary
+        return sorted(summaries.values(), key=lambda item: item.start)
 
-    def _spikes_from_payload(self, payload: List[Dict[str, Any]]) -> List[FluviusPeakMeasurement]:
-        peaks: List[FluviusPeakMeasurement] = []
+    def _spikes_from_payload(self, payload: list[dict[str, Any]]) -> list[FluviusPeakMeasurement]:
+        peaks: list[FluviusPeakMeasurement] = []
         for chunk in payload:
             period_start = self._parse_datetime(chunk.get("d"))
             period_end = self._parse_datetime(chunk.get("de")) or period_start
@@ -892,97 +603,76 @@ class FluviusApiClient:
         peaks.sort(key=lambda item: item.period_start)
         return peaks
 
-    def _interval_from_payload(
-        self,
-        payload: List[Dict[str, Any]],
-    ) -> List[FluviusIntervalMeasurement]:
-        """Parse the raw API response into interval measurements.
-        
-        Each item in the payload represents one interval with:
-        - d: start datetime (ISO format)
-        - de: end datetime (ISO format)
-        - v: array of values with t=1 for consumption, t=2 for injection
+    def _quarter_hourly_from_payload(
+        self, payload: list[dict[str, Any]]
+    ) -> list[FluviusQuarterHourlyMeasurement]:
+        """Parse the payload, keeping only intervals of the resolved length."""
+
+        return self._keep_resolved_intervals(self._intervals_from_payload(payload))
+
+    def _intervals_from_payload(
+        self, payload: list[dict[str, Any]]
+    ) -> list[FluviusQuarterHourlyMeasurement]:
+        """Parse every interval in the payload, whatever its length.
+
+        The granularity probe needs the raw lengths to tell what a candidate code
+        actually served; every other caller wants _quarter_hourly_from_payload.
         """
-        measurements: List[FluviusIntervalMeasurement] = []
-        target_unit = self._target_unit_code()
-        skipped_intervals = 0
-        skipped_units: Dict[int, int] = {}
-        unknown_types: Dict[int, int] = {}
 
+        measurements = {}
         for interval in payload:
-            start = self._parse_datetime(interval.get("d"))
-            end = self._parse_datetime(interval.get("de"))
-            if not start or not end:
-                skipped_intervals += 1
+            summary = self._summarize_day(interval)
+            if summary is None or not interval.get("de"):
                 continue
-
-            consumption = 0.0
-            injection = 0.0
-
-            for reading in interval.get("v", []) or []:
-                value_type = self._safe_int(reading.get("t"))  # 1=consumption, 2=injection
-                unit = self._safe_int(reading.get("u"))
-                value = self._safe_float(reading.get("v"))
-
-                # Skip readings that don't match the target unit (for gas meters)
-                if target_unit is not None and unit != target_unit:
-                    skipped_units[unit] = skipped_units.get(unit, 0) + 1
-                    continue
-                # Skip volume readings for electricity meters
-                if target_unit is None and unit == CUBIC_METER_UNIT_CODE:
-                    skipped_units[unit] = skipped_units.get(unit, 0) + 1
-                    continue
-
-                if value_type == 1:
-                    consumption += value
-                elif value_type == 2:
-                    injection += value
-                else:
-                    unknown_types[value_type] = unknown_types.get(value_type, 0) + 1
-
-            measurements.append(
-                FluviusIntervalMeasurement(
-                    start=start,
-                    end=end,
-                    consumption=consumption,
-                    injection=injection,
-                )
+            measurements[summary.start] = FluviusQuarterHourlyMeasurement(
+                start=summary.start,
+                end=summary.end,
+                consumption=summary.metrics["consumption_total"],
+                injection=summary.metrics["injection_total"],
+                metrics=summary.metrics,
             )
+        return sorted(measurements.values(), key=lambda item: item.start)
 
-        if skipped_intervals:
-            LOGGER.debug(
-                "Interval data: dropped %d interval(s) with an unparsable 'd'/'de' timestamp",
-                skipped_intervals,
-            )
-        if skipped_units:
-            LOGGER.debug("Interval data: ignored readings per unit code: %s", skipped_units)
-        if unknown_types:
-            LOGGER.debug(
-                "Interval data: readings with an unhandled type 't' (expected 1 or 2): %s",
-                unknown_types,
-            )
+    def _keep_resolved_intervals(
+        self, measurements: list[FluviusQuarterHourlyMeasurement]
+    ) -> list[FluviusQuarterHourlyMeasurement]:
+        """Drop intervals that are not the length this meter is being read at.
 
-        measurements.sort(key=lambda item: item.start)
-        return measurements
+        Mixed lengths in one import would double-count, since the statistics layer
+        buckets everything into whole hours. Before the probe resolves, the meter's
+        native resolution is assumed; afterwards, whatever the probe settled on.
+        """
 
-    def _summarize_day(self, day_data: Dict[str, Any]) -> Optional[FluviusDailySummary]:
+        seconds = (self._resolved_interval_minutes or self._expected_interval_minutes()) * 60
+        return [item for item in measurements if (item.end - item.start).total_seconds() == seconds]
+
+    def _summarize_day(self, day_data: dict[str, Any]) -> FluviusDailySummary | None:
         start = self._parse_datetime(day_data.get("d"))
         if not start:
             return None
         end = self._parse_datetime(day_data.get("de")) or (start + timedelta(days=1))
-        metrics: Dict[str, float] = {metric: 0.0 for metric in ALL_METRICS}
+        metrics: dict[str, float] = {metric: 0.0 for metric in ALL_METRICS}
         target_unit = self._target_unit_code()
+        matched = False
 
         for reading in day_data.get("v", []) or []:
             direction = self._safe_int(reading.get("dc"))
             tariff = self._safe_int(reading.get("t"), default=1)
             unit = self._safe_int(reading.get("u"))
-            value = self._safe_float(reading.get("v"))
+            raw_value = reading.get("v")
+            if raw_value is None:
+                continue
+            try:
+                value = float(raw_value)
+            except TypeError, ValueError:
+                continue
+            if not math.isfinite(value) or value < 0:
+                continue
 
             if target_unit is not None and unit != target_unit:
                 # Skip duplicate gas readings in the non-selected unit.
                 continue
-            if target_unit is None and unit == CUBIC_METER_UNIT_CODE:
+            if target_unit is None and unit != KILO_WATT_HOUR_UNIT_CODE:
                 # Gas meters return both m3 and kWh. Skip the volume reading when
                 # keeping the default energy-based sensors.
                 continue
@@ -990,17 +680,22 @@ class FluviusApiClient:
             metric_key = self._metric_from_reading(direction, tariff)
             if not metric_key:
                 continue
+            matched = True
             metrics[metric_key] += value
 
+        if not matched or end <= start:
+            return None
         metrics["consumption_total"] = metrics["consumption_high"] + metrics["consumption_low"]
         metrics["injection_total"] = metrics["injection_high"] + metrics["injection_low"]
         metrics["net_consumption"] = metrics["consumption_total"] - metrics["injection_total"]
 
+        start = start.astimezone(UTC)
+        end = end.astimezone(UTC)
         day_id = start.isoformat()
         return FluviusDailySummary(day_id=day_id, start=start, end=end, metrics=metrics)
 
     @staticmethod
-    def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
+    def _parse_datetime(value: str | None) -> datetime | None:
         if not value:
             return None
         fixed = value.replace("Z", "+00:00")
@@ -1009,16 +704,18 @@ class FluviusApiClient:
         except ValueError:
             return None
         if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=timezone.utc)
+            return parsed.replace(tzinfo=UTC)
         return parsed
 
     @staticmethod
-    def _metric_from_reading(direction: int, tariff: int) -> Optional[str]:
+    def _metric_from_reading(direction: int, tariff: int) -> str | None:
         """Return the metric bucket that should be incremented for a reading."""
 
+        if tariff not in (1, 2):
+            return None
         is_high_tariff = tariff == 1
         if direction == 0:
-            return "consumption_high" if is_high_tariff else "consumption_low"
+            return "consumption_high" if is_high_tariff else "injection_high"
         if direction == 1:
             return "consumption_high" if is_high_tariff else "injection_high"
         if direction == 2:
@@ -1029,12 +726,12 @@ class FluviusApiClient:
     def _safe_int(value: Any, default: int = 0) -> int:
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return default
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
         try:
             return float(value or 0.0)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             return default

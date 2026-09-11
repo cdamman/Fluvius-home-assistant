@@ -1,15 +1,15 @@
 """Tests for the Fluvius Energy config flow."""
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from homeassistant import data_entry_flow
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
-tests_common = pytest.importorskip("tests.common")
-MockConfigEntry = tests_common.MockConfigEntry
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
+from custom_components.fluvius.api import FluviusAuthenticationError
 from custom_components.fluvius.const import (
     CONF_EAN,
     CONF_METER_SERIAL,
@@ -17,6 +17,8 @@ from custom_components.fluvius.const import (
     DOMAIN,
     METER_TYPE_ELECTRICITY,
 )
+
+pytestmark = pytest.mark.usefixtures("recorder_mock")
 
 USER_INPUT = {
     CONF_EMAIL: "test@example.com",
@@ -30,13 +32,16 @@ USER_INPUT = {
 async def test_user_flow_success(hass):
     """Test the happy path of the config flow."""
 
-    with patch(
-        "custom_components.fluvius.config_flow.async_create_fluvius_session",
-        return_value=MagicMock(),
-    ), patch(
-        "custom_components.fluvius.config_flow.FluviusApiClient",
-        autospec=True,
-    ) as mock_client:
+    with (
+        patch(
+            "custom_components.fluvius.config_flow.async_create_fluvius_session",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "custom_components.fluvius.config_flow.FluviusApiClient",
+            autospec=True,
+        ) as mock_client,
+    ):
         instance = mock_client.return_value
         instance.fetch_daily_summaries = AsyncMock(return_value=[])
 
@@ -54,15 +59,20 @@ async def test_user_flow_success(hass):
 async def test_user_flow_invalid_auth(hass):
     """Ensure invalid credentials bubble up as form errors."""
 
-    with patch(
-        "custom_components.fluvius.config_flow.async_create_fluvius_session",
-        return_value=MagicMock(),
-    ), patch(
-        "custom_components.fluvius.config_flow.FluviusApiClient",
-        autospec=True,
-    ) as mock_client:
+    with (
+        patch(
+            "custom_components.fluvius.config_flow.async_create_fluvius_session",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "custom_components.fluvius.config_flow.FluviusApiClient",
+            autospec=True,
+        ) as mock_client,
+    ):
         instance = mock_client.return_value
-        instance.fetch_daily_summaries = AsyncMock(side_effect=Exception("auth failure"))
+        instance.fetch_daily_summaries = AsyncMock(
+            side_effect=FluviusAuthenticationError("auth failure")
+        )
 
         result = await hass.config_entries.flow.async_init(
             DOMAIN,
@@ -80,13 +90,16 @@ async def test_reauth_updates_entry(hass):
     entry = MockConfigEntry(domain=DOMAIN, data=USER_INPUT)
     entry.add_to_hass(hass)
 
-    with patch(
-        "custom_components.fluvius.config_flow.async_create_fluvius_session",
-        return_value=MagicMock(),
-    ), patch(
-        "custom_components.fluvius.config_flow.FluviusApiClient",
-        autospec=True,
-    ) as mock_client:
+    with (
+        patch(
+            "custom_components.fluvius.config_flow.async_create_fluvius_session",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "custom_components.fluvius.config_flow.FluviusApiClient",
+            autospec=True,
+        ) as mock_client,
+    ):
         instance = mock_client.return_value
         instance.fetch_daily_summaries = AsyncMock(return_value=[])
 
@@ -96,5 +109,18 @@ async def test_reauth_updates_entry(hass):
             data=USER_INPUT,
         )
 
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    with (
+        patch(
+            "custom_components.fluvius.config_flow.FluviusApiClient.fetch_daily_summaries",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "homeassistant.config_entries.ConfigEntries.async_reload", AsyncMock(return_value=True)
+        ),
+    ):
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], user_input=USER_INPUT
+        )
     assert result["type"] == data_entry_flow.FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"

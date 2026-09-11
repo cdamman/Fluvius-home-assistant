@@ -1,10 +1,12 @@
 """Config flow for the Fluvius Energy integration."""
+
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import voluptuous as vol
-
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
@@ -12,6 +14,7 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.selector import (
     BooleanSelector,
+    DateTimeSelector,
     NumberSelector,
     NumberSelectorConfig,
     SelectOptionDict,
@@ -22,12 +25,14 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
-from .api import FluviusApiClient, FluviusApiError
+from .api import FluviusApiClient, FluviusApiError, FluviusAuthenticationError
 from .const import (
     CONF_DAYS_BACK,
-    CONF_EMAIL,
     CONF_EAN,
+    CONF_EMAIL,
     CONF_GAS_UNIT,
+    CONF_GRANULARITY,
+    CONF_HISTORY_UNTIL,
     CONF_METER_SERIAL,
     CONF_METER_TYPE,
     CONF_PASSWORD,
@@ -35,23 +40,31 @@ from .const import (
     CONF_VERBOSE_LOGGING,
     DEFAULT_DAYS_BACK,
     DEFAULT_GAS_UNIT,
+    DEFAULT_GRANULARITY,
     DEFAULT_METER_TYPE,
     DEFAULT_TIMEZONE,
     DEFAULT_VERBOSE_LOGGING,
     DOMAIN,
-    METER_TYPE_ELECTRICITY,
-    METER_TYPE_GAS,
+    GAS_SUPPORTED_GRANULARITY,
     GAS_UNIT_CUBIC_METERS,
     GAS_UNIT_KWH,
+    HOURLY_GRANULARITY,
+    METER_TYPE_ELECTRICITY,
+    METER_TYPE_GAS,
+    QUARTER_HOURLY_GRANULARITY,
 )
 from .http import async_create_fluvius_session
 
 DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_EMAIL): TextSelector(TextSelectorConfig(type=TextSelectorType.EMAIL)),
-        vol.Required(CONF_PASSWORD): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
+        vol.Required(CONF_PASSWORD): TextSelector(
+            TextSelectorConfig(type=TextSelectorType.PASSWORD)
+        ),
         vol.Required(CONF_EAN): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
-        vol.Required(CONF_METER_SERIAL): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+        vol.Required(CONF_METER_SERIAL): TextSelector(
+            TextSelectorConfig(type=TextSelectorType.TEXT)
+        ),
         vol.Required(
             CONF_METER_TYPE,
             default=DEFAULT_METER_TYPE,
@@ -60,6 +73,15 @@ DATA_SCHEMA = vol.Schema(
                 options=[
                     SelectOptionDict(value=METER_TYPE_ELECTRICITY, label="Electricity meter"),
                     SelectOptionDict(value=METER_TYPE_GAS, label="Gas meter"),
+                ],
+                mode="dropdown",
+            )
+        ),
+        vol.Required(CONF_GAS_UNIT, default=DEFAULT_GAS_UNIT): SelectSelector(
+            SelectSelectorConfig(
+                options=[
+                    SelectOptionDict(value=GAS_UNIT_KWH, label="Energy (kWh)"),
+                    SelectOptionDict(value=GAS_UNIT_CUBIC_METERS, label="Volume (m3)"),
                 ],
                 mode="dropdown",
             )
@@ -76,18 +98,22 @@ class FluviusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._reauth_entry: ConfigEntry | None = None
 
-    async def async_step_user(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         return await self._async_credentials_step("user", user_input)
 
-    async def async_step_reauth(self, entry_data: Dict[str, Any]) -> FlowResult:
+    async def async_step_reauth(self, entry_data: dict[str, Any]) -> FlowResult:
         _ = entry_data  # not used; included for signature compatibility
         self._reauth_entry = self.hass.config_entries.async_get_entry(self.context["entry_id"])
         return await self.async_step_reauth_confirm()
 
-    async def async_step_reauth_confirm(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
         if self._reauth_entry is None:
             return self.async_abort(reason="unknown")
-        return await self._async_credentials_step("reauth_confirm", user_input, reauth_entry=self._reauth_entry)
+        return await self._async_credentials_step(
+            "reauth_confirm", user_input, reauth_entry=self._reauth_entry
+        )
 
     @staticmethod
     @callback
@@ -97,11 +123,11 @@ class FluviusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def _async_credentials_step(
         self,
         step_id: str,
-        user_input: Optional[Dict[str, Any]],
+        user_input: dict[str, Any] | None,
         reauth_entry: ConfigEntry | None = None,
     ) -> FlowResult:
-        errors: Dict[str, str] = {}
-        defaults: Dict[str, Any] = {}
+        errors: dict[str, str] = {}
+        defaults: dict[str, Any] = {}
         if reauth_entry:
             defaults = {
                 CONF_EMAIL: reauth_entry.data[CONF_EMAIL],
@@ -109,10 +135,24 @@ class FluviusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_EAN: reauth_entry.data[CONF_EAN],
                 CONF_METER_SERIAL: reauth_entry.data[CONF_METER_SERIAL],
                 CONF_METER_TYPE: reauth_entry.data.get(CONF_METER_TYPE, DEFAULT_METER_TYPE),
+                CONF_GAS_UNIT: reauth_entry.options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT),
             }
 
         if user_input is not None:
-            data = user_input if not reauth_entry else {**defaults, **user_input}
+            data = dict(user_input) if not reauth_entry else {**defaults, **user_input}
+            data[CONF_EAN] = data[CONF_EAN].strip().replace(" ", "")
+            data[CONF_METER_SERIAL] = data[CONF_METER_SERIAL].strip()
+            data[CONF_EMAIL] = data[CONF_EMAIL].strip()
+            gas_unit = data.pop(
+                CONF_GAS_UNIT,
+                (
+                    reauth_entry.options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT)
+                    if reauth_entry
+                    else DEFAULT_GAS_UNIT
+                ),
+            )
+            if reauth_entry and data[CONF_EAN] != reauth_entry.data[CONF_EAN]:
+                return self.async_abort(reason="wrong_account")
             try:
                 await self._async_validate_input(self.hass, data)
             except InvalidAuth:
@@ -123,14 +163,20 @@ class FluviusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "unknown"
             else:
                 if reauth_entry:
-                    self.hass.config_entries.async_update_entry(reauth_entry, data=data)
+                    self.hass.config_entries.async_update_entry(
+                        reauth_entry,
+                        data=data,
+                        options={**reauth_entry.options, CONF_GAS_UNIT: gas_unit},
+                    )
                     await self.hass.config_entries.async_reload(reauth_entry.entry_id)
                     return self.async_abort(reason="reauth_successful")
 
                 await self.async_set_unique_id(data[CONF_EAN])
                 self._abort_if_unique_id_configured()
                 title = f"Fluvius {data[CONF_EAN]}"
-                return self.async_create_entry(title=title, data=data)
+                return self.async_create_entry(
+                    title=title, data=data, options={CONF_GAS_UNIT: gas_unit}
+                )
 
         suggested = {**defaults}
         if user_input:
@@ -139,7 +185,7 @@ class FluviusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(step_id=step_id, data_schema=schema, errors=errors)
 
-    async def _async_validate_input(self, hass: HomeAssistant, data: Dict[str, Any]) -> None:
+    async def _async_validate_input(self, hass: HomeAssistant, data: dict[str, Any]) -> None:
         session = async_create_fluvius_session(hass)
         client = FluviusApiClient(
             session=session,
@@ -151,6 +197,8 @@ class FluviusConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         try:
             await client.fetch_daily_summaries()
+        except FluviusAuthenticationError as err:
+            raise InvalidAuth from err
         except FluviusApiError as err:
             message = str(err).lower()
             if any(key in message for key in ("auth", "password", "credentials")):
@@ -164,13 +212,42 @@ class FluviusOptionsFlowHandler(config_entries.OptionsFlow):
     def __init__(self, entry: ConfigEntry) -> None:
         self._entry = entry
 
-    async def async_step_init(self, user_input: Optional[Dict[str, Any]] = None) -> FlowResult:
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         current_meter_type = self._entry.data.get(CONF_METER_TYPE, DEFAULT_METER_TYPE)
+        current_granularity = self._entry.options.get(CONF_GRANULARITY, DEFAULT_GRANULARITY)
         current_gas_unit = self._entry.options.get(CONF_GAS_UNIT, DEFAULT_GAS_UNIT)
+        if current_granularity != DEFAULT_GRANULARITY:
+            current_granularity = (
+                HOURLY_GRANULARITY
+                if current_meter_type == METER_TYPE_GAS
+                else QUARTER_HOURLY_GRANULARITY
+            )
 
+        errors = {}
         if user_input is not None:
+            user_input = dict(user_input)
+            try:
+                tz = ZoneInfo(user_input.get(CONF_TIMEZONE, DEFAULT_TIMEZONE))
+                if cutoff := user_input.get(CONF_HISTORY_UNTIL):
+                    end = datetime.fromisoformat(cutoff)
+                    if end.tzinfo is None:
+                        end = end.replace(tzinfo=tz)
+                    if end > datetime.now(tz):
+                        raise ValueError("Future history cutoff")
+                    user_input[CONF_HISTORY_UNTIL] = end.isoformat()
+            except ValueError, ZoneInfoNotFoundError:
+                errors["base"] = "invalid_history"
+        if user_input is not None and not errors:
             new_meter_type = user_input.pop(CONF_METER_TYPE, current_meter_type)
             gas_unit = user_input.pop(CONF_GAS_UNIT, current_gas_unit)
+            granularity = str(user_input.get(CONF_GRANULARITY, current_granularity))
+            user_input[CONF_GRANULARITY] = (
+                DEFAULT_GRANULARITY
+                if granularity == DEFAULT_GRANULARITY
+                else HOURLY_GRANULARITY
+                if new_meter_type == METER_TYPE_GAS
+                else QUARTER_HOURLY_GRANULARITY
+            )
             if new_meter_type == METER_TYPE_GAS:
                 user_input[CONF_GAS_UNIT] = gas_unit
             else:
@@ -183,6 +260,16 @@ class FluviusOptionsFlowHandler(config_entries.OptionsFlow):
                 self._entry = self.hass.config_entries.async_get_entry(self._entry.entry_id)
             return self.async_create_entry(data=user_input)
 
+        granularity_options = [
+            SelectOptionDict(value=QUARTER_HOURLY_GRANULARITY, label="Quarter-hour"),
+            SelectOptionDict(value=DEFAULT_GRANULARITY, label="Daily"),
+        ]
+        if current_meter_type == METER_TYPE_GAS:
+            granularity_options = [
+                SelectOptionDict(value=HOURLY_GRANULARITY, label="Hourly"),
+                SelectOptionDict(value=GAS_SUPPORTED_GRANULARITY, label="Daily"),
+            ]
+
         schema_fields = {
             vol.Required(
                 CONF_TIMEZONE,
@@ -193,6 +280,15 @@ class FluviusOptionsFlowHandler(config_entries.OptionsFlow):
                 default=self._entry.options.get(CONF_DAYS_BACK, DEFAULT_DAYS_BACK),
             ): NumberSelector(
                 NumberSelectorConfig(min=1, max=31, mode="box"),
+            ),
+            vol.Required(
+                CONF_GRANULARITY,
+                default=current_granularity,
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=granularity_options,
+                    mode="dropdown",
+                )
             ),
             vol.Required(
                 CONF_METER_TYPE,
@@ -222,9 +318,13 @@ class FluviusOptionsFlowHandler(config_entries.OptionsFlow):
                 CONF_VERBOSE_LOGGING,
                 default=self._entry.options.get(CONF_VERBOSE_LOGGING, DEFAULT_VERBOSE_LOGGING),
             ): BooleanSelector(),
+            vol.Optional(CONF_HISTORY_UNTIL): DateTimeSelector(),
         }
         schema = vol.Schema(schema_fields)
-        return self.async_show_form(step_id="init", data_schema=schema)
+        schema = self.add_suggested_values_to_schema(
+            schema, user_input or dict(self._entry.options)
+        )
+        return self.async_show_form(step_id="init", data_schema=schema, errors=errors)
 
 
 class CannotConnect(HomeAssistantError):

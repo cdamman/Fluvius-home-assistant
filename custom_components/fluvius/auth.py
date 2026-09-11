@@ -1,4 +1,5 @@
 """HTTP-only authentication helpers reused by the integration."""
+
 from __future__ import annotations
 
 import base64
@@ -7,8 +8,9 @@ import json
 import logging
 import re
 import secrets
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 import aiohttp
@@ -44,19 +46,31 @@ class AsyncFluviusHttpAuthenticator:
         self.verbose = verbose
         self.session = session
 
-    async def authenticate(self, username: str, password: str, remember_me: bool = False) -> Dict[str, Any]:
+    async def authenticate(
+        self, username: str, password: str, remember_me: bool = False
+    ) -> dict[str, Any]:
         metadata = await self._fetch_msal_metadata()
-        authority = (metadata.get("authority") or metadata.get("auth", {}).get("authority") or DEFAULT_AUTHORITY).rstrip("/")
+        authority = (
+            metadata.get("authority")
+            or metadata.get("auth", {}).get("authority")
+            or DEFAULT_AUTHORITY
+        ).rstrip("/")
         client_id = metadata.get("clientId") or metadata.get("auth", {}).get("clientId")
         if not client_id:
             raise FluviusAuthError("MSAL config does not expose a clientId")
-        redirect_uri = metadata.get("redirectUri") or metadata.get("auth", {}).get("redirectUri") or DEFAULT_REDIRECT_URI
+        redirect_uri = (
+            metadata.get("redirectUri")
+            or metadata.get("auth", {}).get("redirectUri")
+            or DEFAULT_REDIRECT_URI
+        )
         scopes = _normalise_scopes(metadata)
 
         pkce = _generate_pkce_pair()
         state = _random_urlsafe(32)
         nonce = _random_urlsafe(32)
-        authorize_url = self._build_authorize_url(authority, client_id, redirect_uri, scopes, pkce.challenge, state, nonce, username)
+        authorize_url = self._build_authorize_url(
+            authority, client_id, redirect_uri, scopes, pkce.challenge, state, nonce, username
+        )
 
         self._log("Fetching B2C authorize page...")
         async with self.session.get(authorize_url, timeout=TIMEOUT) as auth_resp:
@@ -89,10 +103,19 @@ class AsyncFluviusHttpAuthenticator:
         )
 
         self._log("Finalising session at CombinedSigninAndSignup/confirmed...")
-        confirm_url = self._build_confirm_url(tenant_base, settings.get("api", "CombinedSigninAndSignup"), csrf_token, trans_id, policy, remember_me)
+        confirm_url = self._build_confirm_url(
+            tenant_base,
+            settings.get("api", "CombinedSigninAndSignup"),
+            csrf_token,
+            trans_id,
+            policy,
+            remember_me,
+        )
         code, redirect_seen = await self._follow_redirects_for_code(confirm_url, state, current_url)
         self._log("Exchanging authorization code for tokens...")
-        token_response = await self._exchange_code_for_tokens(authority, client_id, redirect_uri or redirect_seen, scopes, pkce.verifier, code)
+        token_response = await self._exchange_code_for_tokens(
+            authority, client_id, redirect_uri or redirect_seen, scopes, pkce.verifier, code
+        )
         return token_response
 
     # -- helpers ---------------------------------------------------------
@@ -100,7 +123,7 @@ class AsyncFluviusHttpAuthenticator:
         if self.verbose:
             LOGGER.info(message)
 
-    async def _fetch_msal_metadata(self) -> Dict[str, Any]:
+    async def _fetch_msal_metadata(self) -> dict[str, Any]:
         async with self.session.get(MSAL_CONFIG_URL, timeout=TIMEOUT) as resp:
             resp.raise_for_status()
             return await resp.json()
@@ -114,7 +137,7 @@ class AsyncFluviusHttpAuthenticator:
         code_challenge: str,
         state: str,
         nonce: str,
-        login_hint: Optional[str],
+        login_hint: str | None,
     ) -> str:
         params = {
             "client_id": client_id,
@@ -134,7 +157,7 @@ class AsyncFluviusHttpAuthenticator:
         return f"{authority}/oauth2/v2.0/authorize?{urlencode(params)}"
 
     @staticmethod
-    def _resolve_attribute_fields(sa_fields: Dict[str, Any]) -> Tuple[str, str]:
+    def _resolve_attribute_fields(sa_fields: dict[str, Any]) -> tuple[str, str]:
         attributes = sa_fields.get("AttributeFields", [])
         if not attributes:
             raise FluviusAuthError("SA_FIELDS.AttributeFields is empty")
@@ -202,7 +225,9 @@ class AsyncFluviusHttpAuthenticator:
                 try:
                     data = json.loads(text)
                 except json.JSONDecodeError as exc:  # pragma: no cover - defensive log
-                    raise FluviusAuthError(f"Credential submission returned non-JSON: {text[:200]}") from exc
+                    raise FluviusAuthError(
+                        f"Credential submission returned non-JSON: {text[:200]}"
+                    ) from exc
         status_value = data.get("status")
         if str(status_value) not in {"200", "success"}:
             raise FluviusAuthError(f"Credential submission failed: {data}")
@@ -220,16 +245,22 @@ class AsyncFluviusHttpAuthenticator:
         remember_value = "true" if remember_me else "false"
         base_path = f"confirmed?rememberMe={remember_value}"
         separator = "&" if "?" in base_path else "?"
-        path_with_tokens = f"{base_path}{separator}{urlencode({'csrf_token': csrf_token, 'tx': trans_id})}"
+        path_with_tokens = (
+            f"{base_path}{separator}{urlencode({'csrf_token': csrf_token, 'tx': trans_id})}"
+        )
         return f"{api_base}/{path_with_tokens}&{urlencode({'p': policy})}"
 
-    async def _follow_redirects_for_code(self, start_url: str, expected_state: str, origin_url: str) -> Tuple[str, str]:
+    async def _follow_redirects_for_code(
+        self, start_url: str, expected_state: str, origin_url: str
+    ) -> tuple[str, str]:
         origin = self._extract_origin(origin_url)
         next_url = start_url
         for _ in range(6):
             async with self.session.get(next_url, allow_redirects=False, timeout=TIMEOUT) as resp:
                 if resp.status not in (301, 302, 303, 307, 308):
-                    raise FluviusAuthError("Authorization pipeline did not redirect to redirect_uri")
+                    raise FluviusAuthError(
+                        "Authorization pipeline did not redirect to redirect_uri"
+                    )
                 location = resp.headers.get("Location")
             if not location:
                 raise FluviusAuthError("Redirect response missing Location header")
@@ -252,7 +283,7 @@ class AsyncFluviusHttpAuthenticator:
         scopes: str,
         code_verifier: str,
         code: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         token_url = f"{authority}/oauth2/v2.0/token"
         data = {
             "client_id": client_id,
@@ -286,7 +317,7 @@ def _generate_pkce_pair() -> PKCEPair:
     return PKCEPair(verifier=verifier, challenge=challenge)
 
 
-def _extract_json_variable(name: str, html: str) -> Dict[str, Any]:
+def _extract_json_variable(name: str, html: str) -> dict[str, Any]:
     pattern = re.compile(HTML_VAR_TEMPLATE.format(name=name), re.DOTALL)
     match = pattern.search(html)
     if not match:
@@ -297,9 +328,9 @@ def _extract_json_variable(name: str, html: str) -> Dict[str, Any]:
         raise FluviusAuthError(f"Failed to parse `{name}` JSON payload: {exc}") from exc
 
 
-def _normalise_scopes(metadata: Dict[str, Any]) -> str:
-    candidates: List[Iterable[str]] = []
-    raw_candidates: List[Any] = [
+def _normalise_scopes(metadata: dict[str, Any]) -> str:
+    candidates: list[Iterable[str]] = []
+    raw_candidates: list[Any] = [
         metadata.get("scopes"),
         metadata.get("defaultScopes"),
         metadata.get("apiScopes"),
@@ -321,7 +352,7 @@ def _normalise_scopes(metadata: Dict[str, Any]) -> str:
         elif isinstance(candidate, str):
             candidates.append(candidate.split())
 
-    flat: List[str] = []
+    flat: list[str] = []
     for chunk in candidates:
         for scope in chunk:
             if scope not in flat:
@@ -341,7 +372,7 @@ async def async_get_bearer_token(
     *,
     remember_me: bool = False,
     verbose: bool = False,
-) -> tuple[str, Dict[str, Any]]:
+) -> tuple[str, dict[str, Any]]:
     authenticator = AsyncFluviusHttpAuthenticator(session, verbose=verbose)
     token_response = await authenticator.authenticate(email, password, remember_me=remember_me)
     access_token = token_response.get("access_token")
