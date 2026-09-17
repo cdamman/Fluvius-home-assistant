@@ -42,6 +42,22 @@ GAS_SUPPORTED_GRANULARITY = "4"
 QUARTER_HOURLY_GRANULARITY = "1"
 HOURLY_GRANULARITY = "2"
 
+# Flemish digital meters register electricity per quarter-hour and gas per hour, so
+# the resolution to expect depends on the meter type.
+INTERVAL_MINUTES_BY_METER_TYPE = {
+    METER_TYPE_ELECTRICITY: 15,
+    METER_TYPE_GAS: 60,
+}
+
+# Fluvius does not document the granularity codes: "1" is confirmed to yield
+# 15-minute intervals, "2" hourly ones and "4" daily ones, and the rest is guesswork.
+# Rather than rely on a single hard-coded code, the client probes the candidates below
+# and keeps the first one that actually returns the expected interval length.
+INTERVAL_GRANULARITY_CANDIDATES = {
+    METER_TYPE_ELECTRICITY: (QUARTER_HOURLY_GRANULARITY, "3", HOURLY_GRANULARITY),
+    METER_TYPE_GAS: (HOURLY_GRANULARITY, QUARTER_HOURLY_GRANULARITY, "3"),
+}
+
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
 STORAGE_VERSION = 1

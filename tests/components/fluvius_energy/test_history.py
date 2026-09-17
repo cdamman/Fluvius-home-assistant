@@ -127,10 +127,43 @@ async def test_fetches_entire_window_and_empty_recent_days():
     obj._async_get_access_token = AsyncMock(return_value="test-token")
     obj._fetch_raw_quarter_hourly = AsyncMock(return_value=[])
     await obj.fetch_quarter_hourly_consumption()
-    assert [call.args[1] for call in obj._fetch_raw_quarter_hourly.call_args_list] == list(
-        range(7, 0, -1)
-    )
+    # Every day is still requested, oldest first; an unresolved granularity means each
+    # one is asked for once per candidate code.
+    offsets = [call.args[1] for call in obj._fetch_raw_quarter_hourly.call_args_list]
+    assert sorted(set(offsets), reverse=True) == list(range(7, 0, -1))
+    assert offsets == sorted(offsets, reverse=True)
     obj._async_get_access_token.assert_awaited_once()
+
+
+async def test_empty_window_disables_further_probing():
+    """A window that never answers latches the fetch off instead of probing hourly."""
+
+    obj = client(**{CONF_DAYS_BACK: 2})
+    obj._async_get_access_token = AsyncMock(return_value="test-token")
+    obj._fetch_raw_quarter_hourly = AsyncMock(return_value=[])
+
+    assert await obj.fetch_quarter_hourly_consumption() == []
+    assert obj.interval_unavailable is True
+    assert obj.resolved_granularity is None
+    assert obj.probe_outcomes == dict.fromkeys(("1", "2", "3"), "no data")
+
+    obj._fetch_raw_quarter_hourly.reset_mock()
+    assert await obj.fetch_quarter_hourly_consumption() == []
+    obj._fetch_raw_quarter_hourly.assert_not_awaited()
+
+
+async def test_failing_probe_requests_do_not_disable_the_fetch():
+    """A rejected request says nothing about the meter, so keep retrying."""
+
+    from custom_components.fluvius.api import FluviusApiError
+
+    obj = client(**{CONF_DAYS_BACK: 2})
+    obj._async_get_access_token = AsyncMock(return_value="test-token")
+    obj._fetch_raw_quarter_hourly = AsyncMock(side_effect=FluviusApiError("boom"))
+
+    assert await obj.fetch_quarter_hourly_consumption() == []
+    assert obj.interval_unavailable is False
+    assert all("failed" in outcome for outcome in obj.probe_outcomes.values())
 
 
 def test_cutoff_excludes_overlap_and_has_separate_statistics():
@@ -226,12 +259,67 @@ async def test_cutoff_filters_intervals_and_deduplicates():
 
 
 @pytest.mark.parametrize(("meter_type", "granularity"), [("electricity", "1"), ("gas", "2")])
-async def test_interval_request_granularity(meter_type, granularity):
+async def test_interval_probe_tries_native_granularity_first(meter_type, granularity):
     obj = client()
     obj._meter_type = meter_type
     obj._request_history = AsyncMock(return_value=[])
-    await obj._fetch_raw_quarter_hourly("token", 1)
-    assert obj._request_history.call_args.args[1]["granularity"] == granularity
+    await obj._async_probe_granularity("token", 1)
+    assert obj._request_history.await_args_list[0].args[1]["granularity"] == granularity
+
+
+async def test_interval_probe_prefers_the_configured_granularity():
+    """The option stays meaningful: its code is tried before the defaults."""
+
+    obj = client(**{CONF_GRANULARITY: "7"})
+    obj._request_history = AsyncMock(return_value=[])
+    await obj._async_probe_granularity("token", 1)
+    codes = [call.args[1]["granularity"] for call in obj._request_history.await_args_list]
+    assert codes == ["7", "1", "3", "2"]
+
+
+async def test_interval_probe_settles_on_the_code_that_answers():
+    """A code returning the expected length is remembered and reused."""
+
+    obj = client()
+    quarters = [
+        {
+            "d": f"2026-04-01T10:{minute:02d}:00Z",
+            "de": f"2026-04-01T10:{minute + 15:02d}:00Z",
+            "v": [{"dc": 1, "t": 1, "u": 3, "v": 1}],
+        }
+        for minute in (0, 15, 30)
+    ]
+    obj._request_history = AsyncMock(side_effect=[[], quarters])
+    obj._meter_type = "electricity"
+    obj._options[CONF_GRANULARITY] = "9"
+
+    measurements = await obj._async_probe_granularity("token", 1)
+
+    assert len(measurements) == 3
+    assert obj.resolved_granularity == "1"
+    assert obj.probe_outcomes == {"9": "no data", "1": "15-minute intervals"}
+
+
+async def test_interval_probe_falls_back_to_a_coarser_resolution():
+    """No code serves quarters, so the hourly one is used rather than nothing."""
+
+    obj = client()
+    hours = [
+        {
+            "d": f"2026-04-01T{hour:02d}:00:00Z",
+            "de": f"2026-04-01T{hour + 1:02d}:00:00Z",
+            "v": [{"dc": 1, "t": 1, "u": 3, "v": 1}],
+        }
+        for hour in (10, 11)
+    ]
+    obj._request_history = AsyncMock(side_effect=[hours, [], []])
+
+    measurements = await obj._async_probe_granularity("token", 1)
+
+    assert obj.resolved_granularity == "1"
+    assert obj._resolved_interval_minutes == 60
+    # Kept at the resolution actually served, instead of being filtered out.
+    assert len(measurements) == 2
 
 
 async def test_access_token_is_reused():
@@ -316,6 +404,19 @@ async def test_older_noncontiguous_backfill_overwrites_previous_baseline(hass):
     rows = {r["start"]: r["sum"] for r in add.call_args_list[0].args[2]}
     assert rows[start - timedelta(hours=1)] == 4
     assert rows[start] == 8
+
+
+async def test_gas_statistics_never_carry_an_injection_series(hass):
+    """A gas meter cannot inject, so no injection statistic is published for it."""
+
+    obj = FluviusStatistics(hass, "test_gas_m3", "Test", "m3")
+    obj._store = MagicMock(async_load=AsyncMock(return_value=None), async_save=AsyncMock())
+    start = datetime(2026, 4, 1, tzinfo=UTC)
+    with patch("custom_components.fluvius.statistics.async_add_external_statistics") as add:
+        await obj.async_update([day(start, 3)], [])
+    written = {call.args[1]["statistic_id"] for call in add.call_args_list}
+    assert written
+    assert not [sid for sid in written if "injection" in sid]
 
 
 def test_cutoff_lookback_uses_local_dst_offsets():
